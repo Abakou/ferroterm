@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Ferroterm
+GenericName=Client SSH
+Comment=Terminal SSH, fichiers distants et shells locaux
+Exec=ferroterm
+Icon=ferroterm
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=ssh;sftp;terminal;shell;
+StartupWMClass=ferroterm
+StartupNotify=true
