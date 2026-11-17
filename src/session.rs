@@ -218,7 +218,7 @@ pub struct Workspace {
 }
 
 /// Fichier d'export des sessions, relisible par « Importer des sessions ».
-/// Les mots de passe (coffre Windows) n'y figurent pas.
+/// Les mots de passe (coffre du système) n'y figurent pas.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionExport {
     /// Toujours [`EXPORT_FORMAT`] : distingue ce fichier d'un JSON quelconque.

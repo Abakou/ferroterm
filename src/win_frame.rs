@@ -27,6 +27,8 @@ pub enum CaptionButton {
 /// Zones de la barre de titre, en points logiques egui, mises à jour à chaque image.
 #[derive(Default, Clone)]
 pub struct Regions {
+    /// Lu uniquement par le code natif Windows (`WM_NCHITTEST`).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub height: f32,
     /// Zones qui restent interactives pour egui (menus, actions).
     pub client: Vec<egui::Rect>,
@@ -35,7 +37,10 @@ pub struct Regions {
 
 struct State {
     installed: bool,
+    // Lus uniquement par le code natif Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: isize,
+    #[cfg_attr(not(windows), allow(dead_code))]
     ctx: Option<egui::Context>,
     scale: f32,
     regions: Regions,

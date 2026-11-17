@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::win_frame::CaptionButton;
+
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Rect, Response,
     RichText, Sense, Stroke, TextStyle, Vec2,
@@ -209,9 +211,15 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 
-// --- Icônes (Segoe Fluent Icons, avec repli si la police est absente) --------
+// --- Icônes ----------------------------------------------------------------
+// Segoe Fluent Icons, la police d'icônes de Windows, quand elle est présente.
+// Sinon (Linux, macOS), Codicons, la police d'icônes de VS Code, embarquée
+// (licence CC BY 4.0, voir `assets/codicon-LICENSE.txt`).
 static ICON_FONT: AtomicBool = AtomicBool::new(false);
 
+const CODICONS: &[u8] = include_bytes!("../assets/codicon.ttf");
+
+/// Icône : point de code Segoe Fluent, puis point de code Codicons.
 pub struct Icon(&'static str, &'static str);
 
 impl Icon {
@@ -220,25 +228,25 @@ impl Icon {
     }
 }
 
-pub const ICON_ADD: Icon = Icon("\u{e710}", "+");
-pub const ICON_CLOSE: Icon = Icon("\u{e711}", "×");
-pub const ICON_SEARCH: Icon = Icon("\u{e721}", "🔍");
-pub const ICON_FOLDER: Icon = Icon("\u{e8b7}", "📁");
-pub const ICON_NEW_FOLDER: Icon = Icon("\u{e8f4}", "📁");
-pub const ICON_FILE: Icon = Icon("\u{e7c3}", "📄");
-pub const ICON_LINK: Icon = Icon("\u{e71b}", "🔗");
-pub const ICON_TERMINAL: Icon = Icon("\u{e756}", ">_");
-pub const ICON_SERVER: Icon = Icon("\u{e7f4}", "🖥");
-pub const ICON_DOWNLOAD: Icon = Icon("\u{e896}", "⬇");
-pub const ICON_UPLOAD: Icon = Icon("\u{e898}", "⬆");
-pub const ICON_REFRESH: Icon = Icon("\u{e72c}", "⟳");
-pub const ICON_UP: Icon = Icon("\u{e74a}", "⬆");
-pub const ICON_DELETE: Icon = Icon("\u{e74d}", "🗑");
-pub const ICON_EDIT: Icon = Icon("\u{e70f}", "✏");
-pub const ICON_COPY: Icon = Icon("\u{e8c8}", "⧉");
-pub const ICON_PLAY: Icon = Icon("\u{e768}", "▶");
-pub const ICON_IMPORT: Icon = Icon("\u{e8b5}", "📥");
-pub const ICON_MACRO: Icon = Icon("\u{e945}", "⚡");
+pub const ICON_ADD: Icon = Icon("\u{e710}", "\u{ea60}");
+pub const ICON_CLOSE: Icon = Icon("\u{e711}", "\u{ea76}");
+pub const ICON_SEARCH: Icon = Icon("\u{e721}", "\u{ea6d}");
+pub const ICON_FOLDER: Icon = Icon("\u{e8b7}", "\u{ea83}");
+pub const ICON_NEW_FOLDER: Icon = Icon("\u{e8f4}", "\u{ea80}");
+pub const ICON_FILE: Icon = Icon("\u{e7c3}", "\u{ea7b}");
+pub const ICON_LINK: Icon = Icon("\u{e71b}", "\u{eb15}");
+pub const ICON_TERMINAL: Icon = Icon("\u{e756}", "\u{ea85}");
+pub const ICON_SERVER: Icon = Icon("\u{e7f4}", "\u{eb50}");
+pub const ICON_DOWNLOAD: Icon = Icon("\u{e896}", "\u{eac2}");
+pub const ICON_UPLOAD: Icon = Icon("\u{e898}", "\u{eac3}");
+pub const ICON_REFRESH: Icon = Icon("\u{e72c}", "\u{eb37}");
+pub const ICON_UP: Icon = Icon("\u{e74a}", "\u{eaa1}");
+pub const ICON_DELETE: Icon = Icon("\u{e74d}", "\u{ea81}");
+pub const ICON_EDIT: Icon = Icon("\u{e70f}", "\u{ea73}");
+pub const ICON_COPY: Icon = Icon("\u{e8c8}", "\u{ebcc}");
+pub const ICON_PLAY: Icon = Icon("\u{e768}", "\u{eb2c}");
+pub const ICON_IMPORT: Icon = Icon("\u{e8b5}", "\u{ea6f}");
+pub const ICON_MACRO: Icon = Icon("\u{e945}", "\u{ea86}");
 
 /// Texte « icône + libellé ».
 pub fn label(icon: &Icon, text: &str) -> String {
@@ -274,13 +282,16 @@ fn install_fonts(ctx: &egui::Context) {
     let has_ui = load("ui", &["segoeui.ttf"]);
     let has_semibold = load("ui-semibold", &["seguisb.ttf", "segoeuib.ttf"]);
     let has_mono = load("mono", &["CascadiaMono.ttf", "consola.ttf"]);
-    let has_icons = load("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]);
-    ICON_FONT.store(has_icons, Ordering::Relaxed);
+    let has_segoe_icons = load("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]);
+    ICON_FONT.store(has_segoe_icons, Ordering::Relaxed);
+    if !has_segoe_icons {
+        fonts.font_data.insert("icons".to_string(), Arc::new(FontData::from_static(CODICONS)));
+    }
 
     let mut proportional = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if has_icons {
-        proportional.insert(0, "icons".into());
-    }
+    // Juste après la police du texte : les icônes priment sur les emojis d'egui,
+    // sans que la police d'icônes ne fournisse les caractères ordinaires.
+    proportional.insert(1.min(proportional.len()), "icons".into());
     if has_ui {
         proportional.insert(0, "ui".into());
     }
@@ -591,10 +602,27 @@ pub fn tab(
     }
 }
 
+/// Vrai si une fenêtre modale a été affichée pendant l’image en cours.
+static MODAL_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// Fenêtre modale de l’application : cadre de menu, avec une marge intérieure confortable.
+/// Le fond assombri d’egui couvrirait toute la surface, marge de l’ombre comprise :
+/// il est rendu transparent (il bloque toujours les clics) et `FerroApp` dessine
+/// le sien aux contours de la fenêtre (voir `take_modal_shown`).
 pub fn modal(ctx: &egui::Context, id: egui::Id) -> egui::Modal {
-    egui::Modal::new(id).frame(egui::Frame::popup(&ctx.global_style()).inner_margin(Margin::same(22)))
+    MODAL_SHOWN.store(true, Ordering::Relaxed);
+    egui::Modal::new(id)
+        .backdrop_color(Color32::TRANSPARENT)
+        .frame(egui::Frame::popup(&ctx.global_style()).inner_margin(Margin::same(22)))
 }
+
+/// Indique si une modale a été affichée depuis le dernier appel, et remet l’indicateur à zéro.
+pub fn take_modal_shown() -> bool {
+    MODAL_SHOWN.swap(false, Ordering::Relaxed)
+}
+
+/// Couleur du fond assombri derrière une fenêtre modale (celle d’egui par défaut).
+pub const MODAL_BACKDROP: Color32 = Color32::from_black_alpha(100);
 
 /// Titre de section en petites capitales grises.
 pub fn section(text: &str) -> RichText {
@@ -752,24 +780,46 @@ pub fn hide_panel_resize_line(ui: &mut egui::Ui) -> Arc<egui::Style> {
 pub const TITLE_BAR_HEIGHT: f32 = 36.0;
 const CLOSE_HOVER: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 
-pub const ICON_WIN_MINIMIZE: Icon = Icon("\u{e921}", "–");
-pub const ICON_WIN_MAXIMIZE: Icon = Icon("\u{e922}", "□");
-pub const ICON_WIN_RESTORE: Icon = Icon("\u{e923}", "❐");
-pub const ICON_WIN_CLOSE: Icon = Icon("\u{e8bb}", "×");
+pub const ICON_WIN_MINIMIZE: Icon = Icon("\u{e921}", "\u{eaba}");
+pub const ICON_WIN_MAXIMIZE: Icon = Icon("\u{e922}", "\u{eab9}");
+pub const ICON_WIN_RESTORE: Icon = Icon("\u{e923}", "\u{eabb}");
+pub const ICON_WIN_CLOSE: Icon = Icon("\u{e8bb}", "\u{eab8}");
+
+/// Rayon des coins de la fenêtre quand l'application dessine son propre cadre
+/// (hors Windows), comme VS Code sous Linux.
+pub const WINDOW_RADIUS: u8 = 8;
+/// Marge transparente autour de la fenêtre, où est peinte l'ombre portée.
+pub const WINDOW_SHADOW: f32 = 14.0;
+
+/// Ombre portée de la fenêtre, contenue dans la marge `WINDOW_SHADOW`.
+pub fn window_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 3],
+        blur: 12,
+        spread: 0,
+        color: Color32::from_black_alpha(if p().dark { 110 } else { 60 }),
+    }
+}
 
 /// Bouton de fenêtre (réduire, agrandir, fermer), au style des contrôles de
-/// Windows 11 : 46 px de large, icône Segoe Fluent de 10 px, survol gris clair,
-/// croix rouge au survol. L'état survolé/enfoncé vient du système (`win_frame`)
-/// ou d'egui en repli.
-pub fn window_button(ui: &mut egui::Ui, icon: &Icon, is_close: bool, hovered: bool, pressed: bool) -> Response {
+/// Windows 11 : 46 px de large, survol gris clair, croix rouge au survol.
+/// L'icône vient de Segoe Fluent si la police est chargée, sinon elle est
+/// dessinée en traits fins de 10 px, comme les codicons de VS Code.
+/// L'état survolé/enfoncé vient du système (`win_frame`) ou d'egui en repli.
+/// Hors Windows, les boutons prennent l'apparence de GNOME (voir `adwaita_button`).
+pub fn window_button(ui: &mut egui::Ui, kind: CaptionButton, maximized: bool, hovered: bool, pressed: bool) -> Response {
+    if !cfg!(windows) {
+        return adwaita_button(ui, kind, maximized);
+    }
+    let is_close = kind == CaptionButton::Close;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, TITLE_BAR_HEIGHT), Sense::click());
     let hovered = hovered || response.hovered();
     let pressed = pressed || response.is_pointer_button_down_on();
     let background = match (is_close, hovered, pressed) {
         (true, _, true) => Some(CLOSE_HOVER.gamma_multiply(0.9)),
         (true, true, _) => Some(CLOSE_HOVER),
-        (false, _, true) => Some(Color32::from_white_alpha(0x0a)),
-        (false, true, _) => Some(Color32::from_white_alpha(0x14)),
+        (false, _, true) => Some(p().text.gamma_multiply(0.06)),
+        (false, true, _) => Some(p().text.gamma_multiply(0.1)),
         _ => None,
     };
     if let Some(background) = background {
@@ -781,9 +831,77 @@ pub fn window_button(ui: &mut egui::Ui, icon: &Icon, is_close: bool, hovered: bo
         (_, _, true) => p().text_dim,
         _ => p().text,
     };
-    ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, icon.get(), FontId::proportional(10.0), color);
+
+    if ICON_FONT.load(Ordering::Relaxed) {
+        let icon = match kind {
+            CaptionButton::Minimize => &ICON_WIN_MINIMIZE,
+            CaptionButton::Maximize if maximized => &ICON_WIN_RESTORE,
+            CaptionButton::Maximize => &ICON_WIN_MAXIMIZE,
+            CaptionButton::Close => &ICON_WIN_CLOSE,
+        };
+        ui.painter()
+            .text(rect.center(), Align2::CENTER_CENTER, icon.get(), FontId::proportional(10.0), color);
+    } else {
+        paint_caption_glyph(ui, rect.center(), 5.0, kind, maximized, color);
+    }
     response
+}
+
+/// Bouton de fenêtre au style GNOME (Adwaita, Yaru d'Ubuntu) : pastille ronde
+/// de 24 px affichée au survol, plus marquée au clic, icône
+/// symbolique de 8 px. « Fermer » n'a pas de traitement particulier.
+fn adwaita_button(ui: &mut egui::Ui, kind: CaptionButton, maximized: bool) -> Response {
+    const DIAMETER: f32 = 24.0;
+    const SPACING: f32 = 10.0;
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(DIAMETER + SPACING, TITLE_BAR_HEIGHT), Sense::click());
+    let center = rect.center();
+    // Pas de fond au repos : la pastille n'apparaît qu'au survol.
+    if response.is_pointer_button_down_on() {
+        ui.painter().circle_filled(center, DIAMETER / 2.0, p().text.gamma_multiply(0.25));
+    } else if response.hovered() {
+        ui.painter().circle_filled(center, DIAMETER / 2.0, p().text.gamma_multiply(0.12));
+    }
+    paint_caption_glyph(ui, center, 4.0, kind, maximized, p().text);
+    response
+}
+
+/// Glyphes des boutons de fenêtre en traits de 1 px, alignés sur la grille des
+/// pixels physiques pour rester nets. `h` est le demi-côté du glyphe.
+fn paint_caption_glyph(ui: &egui::Ui, center: egui::Pos2, h: f32, kind: CaptionButton, maximized: bool, color: Color32) {
+    let painter = ui.painter();
+    let ppp = ui.ctx().pixels_per_point();
+    let snap = |v: f32| (v * ppp).round() / ppp + 0.5 / ppp;
+    let stroke = Stroke::new(1.0, color);
+    let c = egui::pos2(snap(center.x), snap(center.y));
+    // Décalage du second cadre de l'icône « restaurer ».
+    let o = (h * 0.4).round().max(2.0);
+    match kind {
+        CaptionButton::Minimize => {
+            painter.hline((c.x - h)..=(c.x + h), c.y, stroke);
+        }
+        CaptionButton::Maximize if maximized => {
+            // Deux fenêtres superposées : celle de devant, et le coin de celle de derrière.
+            let front = Rect::from_min_max(egui::pos2(c.x - h, c.y - h + o), egui::pos2(c.x + h - o, c.y + h));
+            painter.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Middle);
+            let back = [
+                egui::pos2(c.x - h + o, c.y - h + o),
+                egui::pos2(c.x - h + o, c.y - h),
+                egui::pos2(c.x + h, c.y - h),
+                egui::pos2(c.x + h, c.y + h - o),
+                egui::pos2(c.x + h - o, c.y + h - o),
+            ];
+            painter.add(egui::Shape::line(back.to_vec(), stroke));
+        }
+        CaptionButton::Maximize => {
+            let square = Rect::from_center_size(c, Vec2::splat(2.0 * h));
+            painter.rect_stroke(square, 1.0, stroke, egui::StrokeKind::Middle);
+        }
+        CaptionButton::Close => {
+            let d = h;
+            painter.line_segment([egui::pos2(c.x - d, c.y - d), egui::pos2(c.x + d, c.y + d)], stroke);
+            painter.line_segment([egui::pos2(c.x - d, c.y + d), egui::pos2(c.x + d, c.y - d)], stroke);
+        }
+    }
 }
 
 /// Bouton d'action compact de la barre de titre.
@@ -863,16 +981,16 @@ pub fn title_toggle(ui: &mut egui::Ui, glyph: ToggleGlyph, tooltip: &str, active
     response.on_hover_text(tooltip)
 }
 
-pub const ICON_CLOCK: Icon = Icon("\u{e823}", "⏱");
-pub const ICON_USER: Icon = Icon("\u{e77b}", "👤");
-pub const ICON_DISK: Icon = Icon("\u{eda2}", "💽");
-pub const ICON_ARROW_UP: Icon = Icon("\u{e74a}", "↑");
-pub const ICON_ARROW_DOWN: Icon = Icon("\u{e74b}", "↓");
+pub const ICON_CLOCK: Icon = Icon("\u{e823}", "\u{ea82}");
+pub const ICON_USER: Icon = Icon("\u{e77b}", "\u{eb99}");
+pub const ICON_DISK: Icon = Icon("\u{eda2}", "\u{eace}");
+pub const ICON_ARROW_UP: Icon = Icon("\u{e74a}", "\u{eaa1}");
+pub const ICON_ARROW_DOWN: Icon = Icon("\u{e74b}", "\u{ea9a}");
 
-pub const ICON_COLOR: Icon = Icon("\u{e790}", "🎨");
+pub const ICON_COLOR: Icon = Icon("\u{e790}", "\u{eb5c}");
 
-pub const ICON_CHEVRON_DOWN: Icon = Icon("\u{e70d}", "▾");
-pub const ICON_CHEVRON_RIGHT: Icon = Icon("\u{e76c}", "▸");
+pub const ICON_CHEVRON_DOWN: Icon = Icon("\u{e70d}", "\u{eab4}");
+pub const ICON_CHEVRON_RIGHT: Icon = Icon("\u{e76c}", "\u{eab6}");
 
 /// En-tête de groupe de sessions : chevron, dossier, nom et badge de compte.
 /// Toute la ligne est cliquable ; `open` indique l'état déplié.

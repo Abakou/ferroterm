@@ -26,7 +26,13 @@ fn main() -> eframe::Result {
                 height: 64,
             }))
             .with_inner_size([1200.0, 760.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            // Sous Windows, le cadre système est conservé et la barre de titre y est
+            // intégrée (voir `win_frame`). Ailleurs, on le retire : la barre de titre
+            // d'egui fournit déplacement et boutons, et `FerroApp` gère les bords.
+            .with_decorations(cfg!(windows))
+            // Fond transparent hors Windows : coins arrondis et ombre portée.
+            .with_transparent(!cfg!(windows)),
         ..Default::default()
     };
     eframe::run_native(
