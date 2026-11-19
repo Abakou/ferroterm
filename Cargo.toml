@@ -4,6 +4,22 @@ version = "0.1.0"
 edition = "2024"
 description = "Client SSH à onglets avec gestionnaire de sessions et explorateur SFTP"
 
+# Paquet Debian/Ubuntu : `cargo deb` (voir `cargo install cargo-deb`).
+[package.metadata.deb]
+maintainer = "Abakou <abakoubusiness@gmail.com>"
+section = "net"
+priority = "optional"
+# Dépendances calculées depuis les bibliothèques liées à l'exécutable.
+depends = "$auto"
+extended-description = """\
+Client SSH à onglets avec gestionnaire de sessions, explorateur SFTP, \
+supervision du serveur et shells locaux."""
+assets = [
+    ["target/release/ferroterm", "usr/bin/", "755"],
+    ["assets/ferroterm.desktop", "usr/share/applications/", "644"],
+    ["assets/ferroterm-256.png", "usr/share/icons/hicolor/256x256/apps/ferroterm.png", "644"],
+]
+
 [dependencies]
 anyhow = "1"
 arboard = "3"
@@ -47,3 +63,8 @@ windows-sys = { version = "0.52", features = [
 
 [build-dependencies]
 winresource = "0.1.34"
+
+# Coffre de mots de passe hors Windows : Secret Service (GNOME Keyring, KWallet…)
+# sous Linux, trousseau sous macOS. Windows garde son implémentation (`vault.rs`).
+[target.'cfg(not(windows))'.dependencies]
+keyring = "4.2"

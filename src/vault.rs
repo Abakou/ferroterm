@@ -1,8 +1,11 @@
-//! Mots de passe et phrases de passe enregistrés dans le Gestionnaire
-//! d'identification Windows (chiffrés par DPAPI, liés au compte Windows).
-//!
-//! Chaque secret est une identification « générique » nommée `Ferroterm/…`,
-//! visible et supprimable aussi depuis le panneau de configuration Windows.
+//! Mots de passe et phrases de passe enregistrés dans le coffre du système :
+//! - Windows : Gestionnaire d'identification (chiffré par DPAPI, lié au compte).
+//!   Chaque secret est une identification « générique » nommée `Ferroterm/…`,
+//!   visible et supprimable aussi depuis le panneau de configuration.
+//! - Linux : Secret Service (GNOME Keyring, KWallet, KeePassXC…), via `keyring`.
+//!   Chaque secret est l'entrée `Ferroterm/…` du service `ferroterm`, visible
+//!   dans « Mots de passe et clés » (Seahorse).
+//! - macOS : trousseau de session, via `keyring`.
 
 /// Secret enregistrable.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,12 +19,17 @@ pub enum Secret {
 }
 
 impl Secret {
-    /// Nom de l'identification dans le coffre Windows.
+    /// Nom du secret dans le coffre du système.
     fn target(&self) -> String {
         match self {
             Secret::Password(id, 0) => format!("Ferroterm/session/{id}"),
             Secret::Password(id, profile) => format!("Ferroterm/session/{id}/{profile}"),
-            Secret::Passphrase(path) => format!("Ferroterm/key/{}", path.replace('\\', "/").to_lowercase()),
+            Secret::Passphrase(path) => {
+                // Chemins insensibles à la casse sous Windows seulement.
+                let path = path.replace('\\', "/");
+                let path = if cfg!(windows) { path.to_lowercase() } else { path };
+                format!("Ferroterm/key/{path}")
+            }
         }
     }
 }
@@ -31,9 +39,9 @@ pub fn get(secret: &Secret) -> Option<String> {
     imp::read(&secret.target())
 }
 
-/// Vrai si un secret est enregistré.
+/// Vrai si un secret est enregistré. Assez rapide pour être appelé à chaque image.
 pub fn exists(secret: &Secret) -> bool {
-    get(secret).is_some()
+    imp::exists(&secret.target())
 }
 
 /// Enregistre (ou remplace) un secret. `user` n'est qu'indicatif (affiché par Windows).
@@ -75,6 +83,10 @@ mod imp {
         }
     }
 
+    pub fn exists(target: &str) -> bool {
+        read(target).is_some()
+    }
+
     pub fn write(target: &str, user: &str, value: &str) -> anyhow::Result<()> {
         let mut target = wide(target);
         let mut user = wide(user);
@@ -108,18 +120,76 @@ mod imp {
     }
 }
 
-/// Hors Windows : pas de coffre, rien n'est enregistré.
+/// Hors Windows : coffre du système via `keyring` (Secret Service sous Linux,
+/// trousseau sous macOS). Les appels sont bloquants, comme sous Windows.
 #[cfg(not(windows))]
 mod imp {
-    pub fn read(_target: &str) -> Option<String> {
-        None
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use keyring::{Entry, Error};
+
+    /// Service sous lequel sont rangés les secrets ; le nom de l'entrée est la cible.
+    const SERVICE: &str = "ferroterm";
+
+    /// Présence connue de chaque secret. `exists` est appelé à chaque image par
+    /// l'éditeur de session : sans cette mémoire, ce serait un aller-retour
+    /// D-Bus par image. Seule la présence est retenue, jamais le secret.
+    /// Mise à jour par nos propres lectures et écritures ; une modification
+    /// faite ailleurs (Seahorse) n'est vue qu'à la lecture suivante du secret.
+    static KNOWN: LazyLock<Mutex<HashMap<String, bool>>> = LazyLock::new(Default::default);
+
+    fn remember(target: &str, present: bool) {
+        KNOWN.lock().expect("vault").insert(target.to_string(), present);
     }
 
-    pub fn write(_target: &str, _user: &str, _value: &str) -> anyhow::Result<()> {
-        anyhow::bail!("coffre de mots de passe disponible sous Windows uniquement")
+    fn entry(target: &str) -> keyring::Result<Entry> {
+        Entry::new(SERVICE, target)
     }
 
-    pub fn delete(_target: &str) {}
+    pub fn read(target: &str) -> Option<String> {
+        match entry(target).and_then(|e| e.get_password()) {
+            Ok(value) => {
+                remember(target, true);
+                Some(value)
+            }
+            Err(Error::NoEntry) => {
+                remember(target, false);
+                None
+            }
+            // Coffre absent ou verrouillé : on ne mémorise rien, pour réessayer.
+            Err(_) => None,
+        }
+    }
+
+    pub fn exists(target: &str) -> bool {
+        if let Some(&present) = KNOWN.lock().expect("vault").get(target) {
+            return present;
+        }
+        // Première question : on interroge le coffre et la réponse est mémorisée.
+        // Un coffre injoignable est mémorisé comme « absent » lui aussi, pour ne
+        // pas bloquer l'interface à chaque image ; une vraie lecture (connexion)
+        // le réinterrogera.
+        let present = read(target).is_some();
+        remember(target, present);
+        present
+    }
+
+    pub fn write(target: &str, _user: &str, value: &str) -> anyhow::Result<()> {
+        entry(target)
+            .and_then(|e| e.set_password(value))
+            .map_err(|e| anyhow::anyhow!("coffre du système : {e}"))?;
+        remember(target, true);
+        Ok(())
+    }
+
+    pub fn delete(target: &str) {
+        // Absence du secret ou coffre injoignable : sans effet, comme sous Windows.
+        if let Ok(entry) = entry(target) {
+            let _ = entry.delete_credential();
+        }
+        remember(target, false);
+    }
 }
 
 #[cfg(test)]
@@ -130,21 +200,30 @@ mod tests {
     fn targets_are_stable() {
         assert_eq!(Secret::Password(42, 0).target(), "Ferroterm/session/42");
         assert_eq!(Secret::Password(42, 3).target(), "Ferroterm/session/42/3");
+        #[cfg(windows)]
         assert_eq!(
             Secret::Passphrase(r"C:\Users\Moi\.ssh\ID_ed25519".into()).target(),
             "Ferroterm/key/c:/users/moi/.ssh/id_ed25519"
         );
+        #[cfg(not(windows))]
+        assert_eq!(
+            Secret::Passphrase("/home/moi/.ssh/ID_ed25519".into()).target(),
+            "Ferroterm/key//home/moi/.ssh/ID_ed25519"
+        );
     }
 
-    /// Écrit, relit et supprime un secret dans le vrai coffre Windows.
-    #[cfg(windows)]
+    /// Écrit, relit et supprime un secret dans le vrai coffre du système.
+    /// Hors Windows, il faut un trousseau déverrouillé : lancer avec `--ignored`.
+    #[cfg_attr(not(windows), ignore = "demande un trousseau Secret Service déverrouillé")]
     #[test]
-    fn round_trip_in_windows_vault() {
+    fn round_trip_in_system_vault() {
         let secret = Secret::Password(u64::MAX - 7, 0);
         delete(&secret);
         assert_eq!(get(&secret), None);
+        assert!(!exists(&secret));
         set(&secret, "test", "mot de passe é ✓").unwrap();
         assert_eq!(get(&secret).as_deref(), Some("mot de passe é ✓"));
+        assert!(exists(&secret));
         set(&secret, "test", "remplacé").unwrap();
         assert_eq!(get(&secret).as_deref(), Some("remplacé"));
         delete(&secret);

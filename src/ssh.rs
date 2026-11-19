@@ -62,7 +62,7 @@ pub enum Reply {
 pub enum Event {
     Status(String),
     AskHostKey { algorithm: String, fingerprint: String },
-    /// `remember` : propose d'enregistrer la réponse dans le coffre Windows
+    /// `remember` : propose d'enregistrer la réponse dans le coffre du système
     /// (valeur initiale de la case), `None` = pas de case.
     AskText { prompt: String, secret: bool, remember: Option<bool> },
     Connected,
@@ -407,7 +407,7 @@ async fn authenticate(
         }
     }
 
-    // Mot de passe enregistré dans le coffre Windows : essayé sans rien demander.
+    // Mot de passe enregistré dans le coffre du système : essayé sans rien demander.
     // Une session sans id (non enregistrée) n'a pas de mot de passe mémorisé.
     let saved = (session.id != 0).then_some(vault::Secret::Password(session.id, session.profile));
     let mut stale = false;
@@ -480,7 +480,7 @@ async fn load_key(path: &str, ui: &UiLink, replies: &Replies) -> anyhow::Result<
     match russh::keys::load_secret_key(path, None) {
         Ok(key) => Ok(key),
         Err(russh::keys::Error::KeyIsEncrypted) => {
-            // Phrase de passe enregistrée dans le coffre Windows : essayée d'abord.
+            // Phrase de passe enregistrée dans le coffre du système : essayée d'abord.
             let saved = vault::Secret::Passphrase(path.to_string());
             let mut stale = false;
             if let Some(passphrase) = vault::get(&saved) {

@@ -249,7 +249,7 @@ enum TabState {
 
 enum Prompt {
     HostKey { algorithm: String, fingerprint: String },
-    /// `remember` : case « Enregistrer dans le coffre Windows », si proposée.
+    /// `remember` : case « Enregistrer dans le coffre du système », si proposée.
     Text { prompt: String, secret: bool, value: String, remember: Option<bool> },
 }
 
@@ -306,7 +306,7 @@ struct ProfileForm {
     profile: crate::session::Profile,
     use_key: bool,
     port: String,
-    /// Mot de passe saisi ici, enregistré dans le coffre Windows ; vide = inchangé.
+    /// Mot de passe saisi ici, enregistré dans le coffre du système ; vide = inchangé.
     password: String,
     /// Un mot de passe est déjà enregistré pour ce profil.
     saved_password: bool,
@@ -1003,7 +1003,7 @@ impl FerroApp {
             Ok(()) => (
                 "Sessions exportées".into(),
                 format!(
-                    "{} session(s) et {} groupe(s) enregistrés dans {}\n\nLes mots de passe ne sont pas exportés : ils restent dans le coffre Windows de ce poste. Les chemins des clés privées sont exportés tels quels.",
+                    "{} session(s) et {} groupe(s) enregistrés dans {}\n\nLes mots de passe ne sont pas exportés : ils restent dans le coffre du système de ce poste. Les chemins des clés privées sont exportés tels quels.",
                     export.sessions.len(),
                     export.folders.len(),
                     path.display()
@@ -2769,7 +2769,7 @@ impl FerroApp {
                     response.request_focus();
                     if let Some(remember) = remember {
                         ui.add_space(4.0);
-                        ui.checkbox(remember, "Enregistrer dans le coffre Windows")
+                        ui.checkbox(remember, "Enregistrer dans le coffre du système")
                             .on_hover_text("Chiffré par Windows et lié à votre compte : plus de saisie aux prochaines connexions.");
                     }
                     ui.add_space(6.0);
@@ -3222,7 +3222,7 @@ impl FerroApp {
                             ui.horizontal(|ui| {
                                 let dim = theme::p().text_dim;
                                 if passphrase_saved && !form.forget_passphrase {
-                                    ui.label("Enregistrée dans le coffre Windows");
+                                    ui.label("Enregistrée dans le coffre du système");
                                     if ui.small_button("Oublier").clicked() {
                                         form.forget_passphrase = true;
                                     }
@@ -3247,7 +3247,7 @@ impl FerroApp {
                                         .hint_text(hint)
                                         .desired_width(220.0),
                                 )
-                                .on_hover_text("Enregistré dans le coffre Windows (chiffré, lié à votre compte).");
+                                .on_hover_text("Enregistré dans le coffre du système (chiffré, lié à votre compte).");
                                 if kept && ui.small_button("Oublier").clicked() {
                                     form.forget_password = true;
                                     form.password.clear();
@@ -3328,7 +3328,7 @@ impl FerroApp {
                     }
                 }
                 self.save_store();
-                // Secrets dans le coffre Windows.
+                // Secrets dans le coffre du système.
                 use crate::vault::{self, Secret};
                 for profile in removed {
                     vault::delete(&Secret::Password(session.id, profile));
@@ -3369,27 +3369,66 @@ impl Drop for FerroApp {
 }
 
 impl eframe::App for FerroApp {
+    /// Fond transparent : hors Windows, les coins arrondis et l'ombre de la
+    /// fenêtre sont dessinés par l'application (voir `ui`).
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let outer = ui.max_rect();
+        // Hors Windows, la fenêtre n'a pas de cadre système : on dessine ombre,
+        // coins arrondis et bordure, sauf si elle occupe tout l'écran.
+        let framed = !win_frame::is_active()
+            && !ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false));
+        let (window, radius) = if framed {
+            (outer.shrink(theme::WINDOW_SHADOW), theme::WINDOW_RADIUS)
+        } else {
+            (outer, 0)
+        };
+
+        if framed {
+            ui.painter().add(theme::window_shadow().as_shape(window, radius));
+        }
+        // Fond du plan de travail : il apparaît entre les zones arrondies.
+        ui.painter().rect_filled(window, radius, theme::p().title_bar);
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(window), |ui| self.workspace(ui));
+
+        if theme::take_modal_shown() {
+            // Fond assombri limité à la fenêtre, sous les modales (ordre Foreground).
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, Id::unique("modal_backdrop")));
+            painter.rect_filled(window, radius, theme::MODAL_BACKDROP);
+        }
+
+        if framed {
+            // Bordure fine au-dessus de tout le contenu, comme le cadre de VS Code.
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::unique("window_border")));
+            painter.rect_stroke(window, radius, egui::Stroke::new(1.0, theme::p().border), egui::StrokeKind::Inside);
+            resize_borders(ui, outer, window);
+        }
+    }
+}
+
+impl FerroApp {
+    /// Contenu de la fenêtre : barre de titre, barres latérales, zone centrale.
+    fn workspace(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll_connections();
         self.poll_edits(&ctx);
         let mut actions = Vec::new();
 
-        // Fond du plan de travail : il apparaît entre les zones arrondies.
-        ui.painter().rect_filled(ui.max_rect(), 0.0, theme::p().title_bar);
-
         egui::Panel::top("title_bar")
             .exact_size(theme::TITLE_BAR_HEIGHT)
-            .frame(egui::Frame::NONE.fill(theme::p().title_bar))
+            .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| self.title_bar(ui, &mut actions));
 
         egui::Panel::bottom("status")
             .exact_size(22.0)
             .frame(
-                egui::Frame::NONE
-                    .fill(theme::p().title_bar)
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
+                egui::Frame::NONE.inner_margin(egui::Margin::symmetric(12, 0)),
             )
             .show_separator_line(false)
             .show(ui, |ui| self.status_bar(ui));
@@ -3425,6 +3464,37 @@ impl eframe::App for FerroApp {
             self.apply(action, &ctx);
         }
         self.sync_workspace(&ctx);
+    }
+}
+
+/// Bords de redimensionnement d'une fenêtre sans cadre système (hors Windows) :
+/// toute la marge de l'ombre, plus quelques pixels à l'intérieur de la fenêtre.
+/// Ajoutés en dernier pour passer au-dessus des autres zones interactives.
+fn resize_borders(ui: &mut egui::Ui, outer: egui::Rect, window: egui::Rect) {
+    use egui::{CursorIcon, ResizeDirection as Dir, ViewportCommand};
+    let ctx = ui.ctx().clone();
+    let edge = window.left() - outer.left() + 4.0;
+    let corner = edge + 8.0;
+    let (l, r, t, b) = (outer.left(), outer.right(), outer.top(), outer.bottom());
+    let zones = [
+        (egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(l + corner, t + corner)), Dir::NorthWest, CursorIcon::ResizeNorthWest),
+        (egui::Rect::from_min_max(egui::pos2(r - corner, t), egui::pos2(r, t + corner)), Dir::NorthEast, CursorIcon::ResizeNorthEast),
+        (egui::Rect::from_min_max(egui::pos2(l, b - corner), egui::pos2(l + corner, b)), Dir::SouthWest, CursorIcon::ResizeSouthWest),
+        (egui::Rect::from_min_max(egui::pos2(r - corner, b - corner), egui::pos2(r, b)), Dir::SouthEast, CursorIcon::ResizeSouthEast),
+        (egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(r, t + edge)), Dir::North, CursorIcon::ResizeNorth),
+        (egui::Rect::from_min_max(egui::pos2(l, b - edge), egui::pos2(r, b)), Dir::South, CursorIcon::ResizeSouth),
+        (egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(l + edge, b)), Dir::West, CursorIcon::ResizeWest),
+        (egui::Rect::from_min_max(egui::pos2(r - edge, t), egui::pos2(r, b)), Dir::East, CursorIcon::ResizeEast),
+    ];
+    // Les coins sont déclarés après les bords pour l'emporter là où ils se chevauchent.
+    for (rect, dir, cursor) in zones.into_iter().rev() {
+        let response = ui.interact(rect, Id::unique(("resize_border", dir as u8)), egui::Sense::drag());
+        if response.hovered() || response.dragged() {
+            ctx.set_cursor_icon(cursor);
+        }
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
+        }
     }
 }
 
@@ -3745,7 +3815,7 @@ impl FerroApp {
         egui::Panel::left("activity")
             .exact_size(48.0)
             .resizable(false)
-            .frame(egui::Frame::NONE.fill(theme::p().title_bar).inner_margin(egui::Margin::symmetric(6, 8)))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(6, 8)))
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
@@ -3966,20 +4036,13 @@ impl FerroApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (hovered, pressed) = win_frame::caption_state();
-                let maximize_icon = if maximized { &theme::ICON_WIN_RESTORE } else { &theme::ICON_WIN_MAXIMIZE };
-                let buttons = [
-                    (CaptionButton::Close, &theme::ICON_WIN_CLOSE),
-                    (CaptionButton::Maximize, maximize_icon),
-                    (CaptionButton::Minimize, &theme::ICON_WIN_MINIMIZE),
-                ];
-                for (kind, icon) in buttons {
-                    let response = theme::window_button(
-                        ui,
-                        icon,
-                        kind == CaptionButton::Close,
-                        hovered == Some(kind),
-                        pressed == Some(kind),
-                    );
+                if !cfg!(windows) {
+                    // Les pastilles GNOME ne touchent pas le bord de la fenêtre.
+                    ui.add_space(4.0);
+                }
+                for kind in [CaptionButton::Close, CaptionButton::Maximize, CaptionButton::Minimize] {
+                    let response =
+                        theme::window_button(ui, kind, maximized, hovered == Some(kind), pressed == Some(kind));
                     regions.buttons.push((kind, response.rect));
                     if response.clicked() && !native {
                         ctx.send_viewport_cmd(match kind {
