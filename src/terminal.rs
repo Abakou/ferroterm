@@ -276,9 +276,13 @@ impl TerminalView {
         if response.clicked() {
             self.selection = None;
         }
-        // Clic droit : coller (comportement MobaXterm).
+        // Clic droit : copier la sélection s'il y en a une (sans coller),
+        // sinon coller le contenu du presse-papiers.
         if response.secondary_clicked() {
-            if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            if let Some(text) = self.selected_text(parser.screen()) {
+                ui.ctx().copy_text(text);
+                self.selection = None;
+            } else if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                 paste(&mut out.input, &text, bracketed);
             }
         }
