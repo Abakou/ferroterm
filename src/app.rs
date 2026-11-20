@@ -59,6 +59,8 @@ pub struct FerroApp {
     /// Vue affichée dans le panneau gauche, choisie dans la barre d'activité.
     side_view: SideView,
     selected_macro: Option<u64>,
+    /// Macro qui doit prendre le focus clavier à la prochaine image (navigation ↑/↓).
+    macro_focus: Option<u64>,
     macro_editor: Option<MacroEditor>,
     filter: String,
     selected_session: Option<u64>,
@@ -350,6 +352,8 @@ enum Action {
     AskDeleteMacro(u64),
     /// Envoie les commandes de la macro au terminal actif.
     RunMacro(u64),
+    /// Pose la macro sur la ligne de commande du terminal actif, sans Entrée.
+    TypeMacro(u64),
     ToggleFiles,
     ToggleMonitor,
     SetTheme(String),
@@ -424,6 +428,7 @@ impl FerroApp {
             sessions_visible: true,
             side_view: SideView::Sessions,
             selected_macro: None,
+            macro_focus: None,
             macro_editor: None,
             filter: String::new(),
             selected_session: None,
@@ -917,7 +922,8 @@ impl FerroApp {
                 }
             }
             Action::AskDeleteMacro(id) => self.confirm = Some(Confirm::DeleteMacro(id)),
-            Action::RunMacro(id) => self.run_macro(id),
+            Action::RunMacro(id) => self.send_macro(id, true),
+            Action::TypeMacro(id) => self.send_macro(id, false),
             Action::ToggleFiles => self.files_visible = !self.files_visible,
             Action::ToggleMonitor => self.monitor_visible = !self.monitor_visible,
             Action::SplitRight => self.split(false),
@@ -956,10 +962,11 @@ impl FerroApp {
         }
     }
 
-    /// Envoie les commandes d'une macro au terminal de l'onglet actif.
-    fn run_macro(&mut self, id: u64) {
+    /// Envoie une macro au terminal de l'onglet actif : exécutée (chaque ligne
+    /// suivie d'Entrée) ou seulement posée sur la ligne de commande.
+    fn send_macro(&mut self, id: u64, execute: bool) {
         let Some(item) = self.store.get_macro(id) else { return };
-        let input = item.input();
+        let input = if execute { item.input() } else { item.command_line().into_bytes() };
         let name = item.name.clone();
         match self.tabs.get_mut(self.active) {
             Some(tab) if matches!(tab.state, TabState::Connected) => {
@@ -1326,7 +1333,10 @@ impl FerroApp {
     // Panneau des sessions
     // ------------------------------------------------------------------
 
-    /// Liste des macros : double-clic pour exécuter dans le terminal actif.
+    /// Liste des macros : un clic sélectionne, un double-clic (ou Entrée pendant la
+    /// navigation au clavier) lance la macro — exécutée si « Exécution automatique »
+    /// est cochée, sinon posée sur la ligne de commande du terminal actif.
+    /// Le menu contextuel propose toujours les deux.
     fn macros_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         if self.store.macros.is_empty() {
             ui.add_space(8.0);
@@ -1338,22 +1348,49 @@ impl FerroApp {
             );
             return;
         }
+        // Lancer une macro : l'exécuter si « Exécution automatique » est cochée,
+        // sinon la poser sur la ligne de commande.
+        let launch = |item: &Macro| if item.auto_run { Action::RunMacro(item.id) } else { Action::TypeMacro(item.id) };
+        let focus_request = self.macro_focus.take();
+        // Ligne qui a le focus clavier, et touches à traiter après la liste.
+        let mut focused: Option<usize> = None;
         egui::ScrollArea::vertical().id_salt("macros").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            for item in &self.store.macros {
+            for (index, item) in self.store.macros.iter().enumerate() {
                 let count = item.lines().count();
                 let first = item.lines().next().unwrap_or("");
                 let subtitle = if count > 1 { format!("{first}  (+{})", count - 1) } else { first.to_string() };
                 let selected = self.selected_macro == Some(item.id);
                 let response = theme::list_row(ui, selected, &theme::ICON_MACRO, &item.name, Some(&subtitle))
                     .on_hover_text(item.commands.trim_end());
+                if focus_request == Some(item.id) {
+                    response.request_focus();
+                    response.scroll_to_me(None);
+                }
+                // Clic : sélectionner (et prendre le focus pour la navigation au clavier).
                 if response.clicked() {
                     self.selected_macro = Some(item.id);
+                    response.request_focus();
                 }
+                // Double-clic : lancer la macro.
                 if response.double_clicked() {
-                    actions.push(Action::RunMacro(item.id));
+                    actions.push(launch(item));
+                }
+                if response.has_focus() {
+                    focused = Some(index);
+                    // Les flèches servent à parcourir la liste, pas à déplacer le focus.
+                    ui.memory_mut(|m| {
+                        m.set_focus_lock_filter(
+                            response.id,
+                            egui::EventFilter { vertical_arrows: true, ..Default::default() },
+                        )
+                    });
                 }
                 response.context_menu(|ui| {
+                    if ui.button(theme::label(&theme::ICON_EDIT, "Insérer sur la ligne de commande")).clicked() {
+                        actions.push(Action::TypeMacro(item.id));
+                        ui.close();
+                    }
                     if ui.button(theme::label(&theme::ICON_PLAY, "Exécuter")).clicked() {
                         actions.push(Action::RunMacro(item.id));
                         ui.close();
@@ -1377,6 +1414,38 @@ impl FerroApp {
                 });
             }
         });
+
+        // Navigation au clavier : ↑/↓ (Début/Fin) déplacent la sélection, Entrée lance la macro.
+        let Some(index) = focused else { return };
+        let last = self.store.macros.len() - 1;
+        let (up, down, home, end, enter) = ui.input(|i| {
+            (
+                i.key_pressed(Key::ArrowUp),
+                i.key_pressed(Key::ArrowDown),
+                i.key_pressed(Key::Home),
+                i.key_pressed(Key::End),
+                i.key_pressed(Key::Enter),
+            )
+        });
+        let target = if up {
+            index.saturating_sub(1)
+        } else if down {
+            (index + 1).min(last)
+        } else if home {
+            0
+        } else if end {
+            last
+        } else {
+            index
+        };
+        if target != index {
+            let id = self.store.macros[target].id;
+            self.selected_macro = Some(id);
+            self.macro_focus = Some(id);
+            ui.ctx().request_repaint();
+        } else if enter {
+            actions.push(launch(&self.store.macros[index]));
+        }
     }
 
     fn sessions_panel(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -2213,16 +2282,39 @@ impl FerroApp {
         ui.advance_cursor_after_rect(body);
         content.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.18).max(8.0));
-            ui.label(RichText::new("Sessions récentes").size(16.0).family(theme::semibold()));
-            ui.add_space(8.0);
+            let title = RichText::new("Sessions récentes").size(16.0).family(theme::semibold());
             if recent.is_empty() {
+                ui.label(title);
+                ui.add_space(8.0);
                 ui.label(RichText::new("Aucune session ouverte récemment").color(pal.text_dim));
-            }
-            for (id, name, target) in &recent {
-                let text = theme::label(&theme::ICON_SERVER, name);
-                if ui.add(egui::Button::new(text).frame_when_inactive(false)).on_hover_text(target).clicked() {
-                    actions.push(Action::Connect(*id));
-                }
+            } else {
+                // Bloc centré dont les lignes sont alignées à gauche : sa largeur est
+                // celle du nom le plus long (marges du bouton comprises).
+                let pad = ui.spacing().button_padding.x;
+                let button_font = egui::TextStyle::Button.resolve(ui.style());
+                let title_font = egui::FontId::new(16.0, theme::semibold());
+                let width = ui.fonts_mut(|f| {
+                    let title = f.layout_no_wrap("Sessions récentes".into(), title_font, pal.text).size().x;
+                    let widest = recent.iter().fold(title, |widest, (_, name, _)| {
+                        let text = theme::label(&theme::ICON_SERVER, name);
+                        widest.max(f.layout_no_wrap(text, button_font.clone(), pal.text).size().x)
+                    });
+                    widest + 2.0 * pad
+                });
+                let width = width.min(ui.available_width());
+                ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(pad);
+                        ui.label(title);
+                    });
+                    ui.add_space(8.0);
+                    for (id, name, target) in &recent {
+                        let text = theme::label(&theme::ICON_SERVER, name);
+                        if ui.add(egui::Button::new(text).frame_when_inactive(false)).on_hover_text(target).clicked() {
+                            actions.push(Action::Connect(*id));
+                        }
+                    }
+                });
             }
             ui.add_space(14.0);
             self.local_menu(ui, &theme::label(&theme::ICON_TERMINAL, "Terminal local"), &mut actions);
@@ -3005,9 +3097,20 @@ impl FerroApp {
                 );
             });
             ui.label(
-                RichText::new("Une commande par ligne ; chaque ligne est suivie d'Entrée dans le terminal actif.")
+                RichText::new("Une commande par ligne ; chaque ligne est suivie d'Entrée à l'exécution.")
                     .small()
                     .color(theme::p().text_dim),
+            );
+            ui.add_space(6.0);
+            ui.checkbox(&mut editor.item.auto_run, "Exécution automatique");
+            ui.label(
+                RichText::new(if editor.item.auto_run {
+                    "Double-clic ou Entrée : la macro est exécutée directement dans le terminal actif."
+                } else {
+                    "Double-clic ou Entrée : la macro est posée sur la ligne de commande, sans être exécutée."
+                })
+                .small()
+                .color(theme::p().text_dim),
             );
             if let Some(error) = &editor.error {
                 ui.colored_label(theme::p().red, error);

@@ -143,6 +143,10 @@ pub struct Macro {
     pub name: String,
     /// Une commande par ligne ; chaque ligne est suivie d'Entrée à l'exécution.
     pub commands: String,
+    /// Lancée (double-clic ou Entrée), la macro est exécutée ; sinon elle est
+    /// seulement posée sur la ligne de commande.
+    #[serde(default, alias = "run_on_click")]
+    pub auto_run: bool,
 }
 
 impl Macro {
@@ -159,6 +163,12 @@ impl Macro {
             bytes.push(b'\r');
         }
         bytes
+    }
+
+    /// Texte à poser sur la ligne de commande sans l'exécuter : les lignes
+    /// sont jointes par « ; » pour qu'aucun retour chariot ne les lance.
+    pub fn command_line(&self) -> String {
+        self.lines().map(str::trim).collect::<Vec<_>>().join("; ")
     }
 }
 
@@ -533,8 +543,14 @@ mod tests {
 
     #[test]
     fn macro_input_sends_each_line_with_enter() {
-        let item = Macro { id: 1, name: "m".into(), commands: "cd /tmp\r\n\n  ls -la  \n".into() };
+        let item = Macro { id: 1, name: "m".into(), commands: "cd /tmp\r\n\n  ls -la  \n".into(), ..Default::default() };
         assert_eq!(item.input(), b"cd /tmp\r  ls -la\r");
+    }
+
+    #[test]
+    fn macro_command_line_has_no_enter() {
+        let item = Macro { id: 1, name: "m".into(), commands: "cd /tmp\r\n\n  ls -la  \n".into(), ..Default::default() };
+        assert_eq!(item.command_line(), "cd /tmp; ls -la");
     }
 
     #[test]
@@ -542,7 +558,7 @@ mod tests {
         let mut store = SessionStore::default();
         let id = store.save_macro(Macro { name: "a".into(), commands: "ls".into(), ..Default::default() });
         assert_ne!(id, 0);
-        store.save_macro(Macro { id, name: "b".into(), commands: "pwd".into() });
+        store.save_macro(Macro { id, name: "b".into(), commands: "pwd".into(), ..Default::default() });
         assert_eq!(store.macros.len(), 1);
         assert_eq!(store.get_macro(id).map(|m| m.name.as_str()), Some("b"));
         store.remove_macro(id);

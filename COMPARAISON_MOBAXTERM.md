@@ -68,7 +68,7 @@ Ferroterm aujourd'hui : clé privée OpenSSH ou mot de passe, enregistrables dan
 
 ## Macros
 
-Ferroterm aujourd'hui : liste de commandes envoyées ligne par ligne au terminal actif, lancées par double-clic.
+Ferroterm aujourd'hui : liste de commandes ; un double-clic (ou Entrée en naviguant au clavier avec ↑/↓) les pose sur la ligne de commande du terminal actif sans les exécuter, ou les exécute si l'option « Exécution automatique » de la macro est cochée ; « Exécuter » (clic droit) les envoie ligne par ligne.
 
 | À reprendre | Ce que fait MobaXterm | Priorité |
 |---|---|---|
