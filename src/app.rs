@@ -110,39 +110,63 @@ pub struct FerroApp {
     persist_workspace: bool,
 }
 
-/// Ce qu'un onglet affiche : une session SSH ou un shell local.
+/// Ce qu'un onglet affiche : une session distante (SSH ou FTP) ou un shell local.
 #[derive(Clone)]
 enum Target {
-    Ssh(Session),
+    Remote(Session),
     Local(LocalShell),
 }
 
 impl Target {
     fn title(&self) -> &str {
         match self {
-            Target::Ssh(s) => &s.name,
+            Target::Remote(s) => &s.name,
             Target::Local(s) => &s.name,
         }
     }
 
     fn subtitle(&self) -> String {
         match self {
-            Target::Ssh(s) if s.has_profiles() => format!("{} (profil {})", s.target(), s.profile_name()),
-            Target::Ssh(s) => s.target(),
+            Target::Remote(s) if s.has_profiles() => format!("{} (profil {})", s.target(), s.profile_name()),
+            Target::Remote(s) => s.target(),
             Target::Local(s) => s.program.display().to_string(),
         }
     }
 
     fn session_id(&self) -> Option<u64> {
         match self {
-            Target::Ssh(s) => Some(s.id),
+            Target::Remote(s) => Some(s.id),
             Target::Local(_) => None,
+        }
+    }
+
+    /// Session sans terminal (SFTP seul, FTP) : l'explorateur de fichiers
+    /// occupe l'onglet.
+    fn files_only(&self) -> bool {
+        matches!(self, Target::Remote(s) if !s.has_terminal())
+    }
+
+    fn is_ftp(&self) -> bool {
+        matches!(self, Target::Remote(s) if s.is_ftp())
+    }
+
+    /// Session SSH : terminal, explorateur SFTP et supervision.
+    fn is_ssh(&self) -> bool {
+        matches!(self, Target::Remote(s) if s.has_terminal())
+    }
+
+    fn icon(&self) -> &'static theme::Icon {
+        match self {
+            Target::Remote(s) if !s.has_terminal() => &theme::ICON_FOLDER,
+            Target::Remote(_) => &theme::ICON_SERVER,
+            Target::Local(_) => &theme::ICON_TERMINAL,
         }
     }
 
     fn connect(&self, rt: &tokio::runtime::Runtime, ctx: &egui::Context) -> Connection {
         match self {
-            Target::Ssh(s) => Connection::spawn(rt, s.clone(), ctx.clone()),
+            Target::Remote(s) if s.is_ftp() => crate::ftp::spawn(rt, s.clone(), ctx.clone()),
+            Target::Remote(s) => Connection::spawn(rt, s.clone(), ctx.clone()),
             Target::Local(s) => local::spawn(s, ctx.clone()),
         }
     }
@@ -251,6 +275,8 @@ enum TabState {
 
 enum Prompt {
     HostKey { algorithm: String, fingerprint: String },
+    /// Certificat FTPS non reconnu ; `changed` : un autre avait été approuvé.
+    Certificate { reason: String, fingerprint: String, changed: bool },
     /// `remember` : case « Enregistrer dans le coffre du système », si proposée.
     Text { prompt: String, secret: bool, value: String, remember: Option<bool> },
 }
@@ -539,7 +565,7 @@ impl FerroApp {
                     if let Some(profile) = tab.profile {
                         session.switch_profile(profile);
                     }
-                    Target::Ssh(session)
+                    Target::Remote(session)
                 }),
                 (None, name) => self
                     .shells
@@ -585,12 +611,12 @@ impl FerroApp {
                 group: tab.group,
                 session: tab.target.session_id(),
                 profile: match &tab.target {
-                    Target::Ssh(session) if session.has_profiles() => Some(session.profile),
+                    Target::Remote(session) if session.has_profiles() => Some(session.profile),
                     _ => None,
                 },
                 shell: match &tab.target {
                     Target::Local(shell) => Some(shell.name.clone()),
-                    Target::Ssh(_) => None,
+                    Target::Remote(_) => None,
                 },
                 active: self.group_active.get(tab.group).copied().flatten() == Some(tab.id),
                 title: tab.title.clone(),
@@ -839,7 +865,7 @@ impl FerroApp {
         match action {
             Action::Connect(id) => {
                 if let Some(session) = self.store.get(id).cloned() {
-                    self.open_target(Target::Ssh(session), ctx);
+                    self.open_target(Target::Remote(session), ctx);
                     if self.store.recent.first() != Some(&id) {
                         self.store.touch_recent(id);
                         self.save_store();
@@ -1193,6 +1219,10 @@ impl FerroApp {
                     },
                     Event::AskHostKey { algorithm, fingerprint } => {
                         tab.prompt = Some(Prompt::HostKey { algorithm, fingerprint });
+                        focus_tab = Some(index);
+                    }
+                    Event::AskCertificate { reason, fingerprint, changed } => {
+                        tab.prompt = Some(Prompt::Certificate { reason, fingerprint, changed });
                         focus_tab = Some(index);
                     }
                     Event::AskText { prompt, secret, remember } => {
@@ -1590,12 +1620,20 @@ impl FerroApp {
         }
         for session in &node.sessions {
             let selected = self.selected_session == Some(session.id);
+            // Pastille : protocole (sessions sans terminal : SFTP, FTP) et profil actif (s'il y en a plusieurs).
+            let profile = session.has_profiles().then(|| session.profile_name());
+            let badge = match (!session.has_terminal(), profile) {
+                (true, Some(profile)) => Some(format!("{} · {profile}", session.protocol_label())),
+                (true, None) => Some(session.protocol_label().to_string()),
+                (false, profile) => profile.map(str::to_string),
+            };
+            let icon = if session.has_terminal() { &theme::ICON_SERVER } else { &theme::ICON_FOLDER };
             let response = theme::list_row_badge(
                 ui,
                 selected,
-                &theme::ICON_SERVER,
+                icon,
                 &session.name,
-                session.has_profiles().then(|| session.profile_name()),
+                badge.as_deref(),
                 Some(&session.target()),
             );
             // Pastille d'état si la session est ouverte dans au moins un onglet,
@@ -1640,7 +1678,7 @@ impl FerroApp {
                         .fixed_pos(pos + egui::vec2(14.0, 10.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.label(theme::label(&theme::ICON_SERVER, &session.name));
+                                ui.label(theme::label(icon, &session.name));
                             });
                         });
                 }
@@ -1665,7 +1703,7 @@ impl FerroApp {
                 ui.menu_button(theme::label(&theme::ICON_SERVER, "Changer de profil"), |ui| {
                     for profile in session.profiles() {
                         let active = profile.id == session.profile;
-                        if ui.selectable_label(active, &profile.name).on_hover_text(profile.target()).clicked() {
+                        if ui.selectable_label(active, &profile.name).on_hover_text(profile.target(session.default_port())).clicked() {
                             actions.push(Action::SwitchProfile { session: session.id, profile: profile.id });
                             ui.close();
                         }
@@ -1701,26 +1739,41 @@ impl FerroApp {
     // Panneau SFTP
     // ------------------------------------------------------------------
 
+    /// Panneau droit : fichiers de l'onglet actif (sauf FTP, affichés dans l'onglet).
     fn sftp_panel(&mut self, ui: &mut egui::Ui) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            ui.label(RichText::new("Ouvrez une session SSH pour parcourir ses fichiers.").weak());
+        let Some(tab) = self.tabs.get(self.active) else {
+            ui.label(RichText::new("Ouvrez une session SSH ou FTP pour parcourir ses fichiers.").weak());
             return;
         };
-        ui.label(RichText::new(tab.title()).family(theme::semibold()));
-        if matches!(tab.target, Target::Local(_)) {
-            ui.label(RichText::new("L'explorateur SFTP est disponible pour les sessions SSH.").weak());
+        if tab.target.files_only() {
+            ui.label(RichText::new(tab.title()).family(theme::semibold()));
+            ui.label(RichText::new("Les fichiers de cette session sont affichés dans son onglet.").weak());
             return;
         }
+        self.file_browser(ui, self.active);
+    }
+
+    /// Explorateur des fichiers distants d'un onglet : panneau droit (SFTP) ou
+    /// contenu de l'onglet (FTP).
+    fn file_browser(&mut self, ui: &mut egui::Ui, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else { return };
+        ui.label(RichText::new(tab.title()).family(theme::semibold()));
+        if matches!(tab.target, Target::Local(_)) {
+            ui.label(RichText::new("L'explorateur de fichiers est disponible pour les sessions SSH, SFTP et FTP.").weak());
+            return;
+        }
+        let has_terminal = tab.target.is_ssh();
+        let protocol = if tab.target.is_ftp() { "FTP" } else { "SFTP" };
         match &tab.sftp.available {
             None => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Connexion SFTP…");
+                    ui.label(format!("Connexion {protocol}…"));
                 });
                 return;
             }
             Some(Err(reason)) => {
-                ui.label(RichText::new(format!("SFTP indisponible : {reason}")).weak());
+                ui.label(RichText::new(format!("{protocol} indisponible : {reason}")).weak());
                 return;
             }
             Some(Ok(())) => {}
@@ -1752,13 +1805,16 @@ impl FerroApp {
             if theme::icon_button(ui, &theme::ICON_NEW_FOLDER, "Nouveau dossier").clicked() {
                 self.mkdir_name = Some(String::new());
             }
-            let follow = theme::title_action(
-                ui,
-                &theme::ICON_TERMINAL,
-                "Suivre le dossier courant du terminal",
-                sftp.follow_terminal,
-            );
-            if follow.clicked() {
+            // Sans terminal (SFTP seul, FTP) : rien à suivre.
+            let follow = has_terminal.then(|| {
+                theme::title_action(
+                    ui,
+                    &theme::ICON_TERMINAL,
+                    "Suivre le dossier courant du terminal",
+                    sftp.follow_terminal,
+                )
+            });
+            if follow.is_some_and(|f| f.clicked()) {
                 sftp.follow_terminal = !sftp.follow_terminal;
                 if sftp.follow_terminal {
                     if let Some(cwd) = sftp.last_terminal_cwd.clone() {
@@ -1999,7 +2055,7 @@ impl FerroApp {
             ui.label(RichText::new(theme::ICON_TERMINAL.get()).size(46.0).color(theme::p().accent));
             ui.add_space(4.0);
             ui.label(RichText::new("Ferroterm").size(30.0).family(theme::semibold()));
-            ui.label(RichText::new("Terminal SSH, fichiers distants et shells locaux").color(theme::p().text_dim));
+            ui.label(RichText::new("Terminal SSH, fichiers distants (SFTP, FTP) et shells locaux").color(theme::p().text_dim));
             ui.add_space(20.0);
             // Rangée centrée : sa largeur réelle est mesurée d'une image sur l'autre.
             // Si elle ne tient plus dans la largeur disponible, les boutons s'empilent.
@@ -2430,10 +2486,7 @@ impl FerroApp {
                                         TabState::Connected => theme::p().green,
                                         TabState::Closed(_) => theme::p().text_dim,
                                     };
-                                    let icon = match tab.target {
-                                        Target::Ssh(_) => &theme::ICON_SERVER,
-                                        Target::Local(_) => &theme::ICON_TERMINAL,
-                                    };
+                                    let icon = tab.target.icon();
                                     // Onglet en cours de renommage : il s'élargit avec le nom saisi.
                                     let edit = editing.as_mut().filter(|e| e.id == tab.id);
                                     let title = match &edit {
@@ -2616,12 +2669,45 @@ impl FerroApp {
             return;
         }
 
-        let mut reconnect = false;
-        let mut close_active = false;
+        let (reconnect, close_active) = if self.tabs[active_index].target.files_only() {
+            self.browser_view(ui, group, active_index)
+        } else {
+            self.terminal_view(ui, group, active_index)
+        };
+        let ctx = ui.ctx().clone();
+        if reconnect {
+            self.reconnect(active_index, &ctx);
+        } else if close_active {
+            self.tabs.remove(active_index);
+            self.normalize_groups();
+        }
+    }
+
+    /// Contenu d'un onglet sans terminal (SFTP seul, FTP) : l'explorateur de fichiers.
+    /// Renvoie (reconnecter, fermer l'onglet).
+    fn browser_view(&mut self, ui: &mut egui::Ui, group: usize, index: usize) -> (bool, bool) {
+        let tab_id = self.tabs[index].id;
+        let browser = egui::Frame::NONE.inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.push_id(("ftp", tab_id), |ui| self.file_browser(ui, index));
+        });
+        let area = browser.response.rect;
+        // Un clic dans l'explorateur rend l'onglet actif : les dialogues (nouveau
+        // dossier, suppression) et le dépôt de fichiers visent l'onglet actif.
+        if ui.input(|i| i.pointer.any_pressed()) && ui.rect_contains_pointer(area) {
+            self.active = index;
+            self.active_group = group;
+        }
+        connection_pill(ui, &self.tabs[index], area)
+    }
+
+    /// Contenu d'un onglet SSH ou local : le terminal, avec la barre de
+    /// supervision. Renvoie (reconnecter, fermer l'onglet).
+    fn terminal_view(&mut self, ui: &mut egui::Ui, group: usize, active_index: usize) -> (bool, bool) {
         let highlighter = self.highlighter.clone();
         let tab = &mut self.tabs[active_index];
 
-        if self.monitor_visible && matches!(tab.target, Target::Ssh(_)) {
+        if self.monitor_visible && tab.target.is_ssh() {
             let stats = tab.monitor.clone();
             egui::Panel::bottom(("monitor", group))
                 .exact_size(30.0)
@@ -2633,31 +2719,7 @@ impl FerroApp {
             ui.push_id(tab.id, |ui| tab.view.show(ui, &tab.conn.parser, highlighter.as_deref())).inner
         });
         let output = terminal.inner;
-        // État de la connexion : pastille flottante, centrée en bas du terminal.
-        let area = terminal.response.rect;
-        let pill = Id::unique(("status", tab.id));
-        match &tab.state {
-            TabState::Connecting(message) => {
-                theme::status_pill(ui, pill, area, |ui| {
-                    ui.spinner();
-                    ui.label(message);
-                });
-            }
-            TabState::Closed(message) => {
-                theme::status_pill(ui, pill, area, |ui| {
-                    theme::status_dot(ui, theme::p().red);
-                    ui.label(message);
-                    ui.add_space(6.0);
-                    if theme::primary_button(ui, &theme::label(&theme::ICON_REFRESH, "Reconnecter")).clicked() {
-                        reconnect = true;
-                    }
-                    if theme::header_button(ui, &theme::ICON_CLOSE, "Fermer l'onglet").clicked() {
-                        close_active = true;
-                    }
-                });
-            }
-            TabState::Connected => {}
-        }
+        let buttons = connection_pill(ui, tab, terminal.response.rect);
         if matches!(tab.state, TabState::Connected) {
             if !output.input.is_empty() {
                 tab.conn.send(Command::Input(output.input));
@@ -2673,14 +2735,7 @@ impl FerroApp {
             self.active = active_index;
             self.active_group = group;
         }
-
-        let ctx = ui.ctx().clone();
-        if reconnect {
-            self.reconnect(active_index, &ctx);
-        } else if close_active {
-            self.tabs.remove(active_index);
-            self.normalize_groups();
-        }
+        buttons
     }
 
     // ------------------------------------------------------------------
@@ -2840,6 +2895,29 @@ impl FerroApp {
                     ui.label("Vérifiez son empreinte avant de continuer :");
                     ui.add_space(4.0);
                     ui.monospace(format!("{algorithm}\n{fingerprint}"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "Faire confiance et se connecter").clicked() {
+                            reply = Some(Reply::HostKey(true));
+                        }
+                        if ui.button("Annuler").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                            reply = Some(Reply::HostKey(false));
+                        }
+                    });
+                }
+                Prompt::Certificate { reason, fingerprint, changed } => {
+                    if *changed {
+                        ui.colored_label(
+                            theme::p().red,
+                            "ATTENTION : ce serveur présente un autre certificat que celui approuvé \
+                             la dernière fois. Ce peut être un renouvellement, ou une interception.",
+                        );
+                        ui.add_space(4.0);
+                    }
+                    ui.label(format!("Le certificat de ce serveur n'est pas reconnu : {reason}."));
+                    ui.label("Vérifiez son empreinte SHA-256 auprès de l'administrateur avant de continuer :");
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(fingerprint.as_str()).monospace()).wrap());
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if theme::primary_button(ui, "Faire confiance et se connecter").clicked() {
@@ -3149,10 +3227,14 @@ impl FerroApp {
         let mut activate = false;
         let mut remove = None;
         let mut select = None;
+        // Avant les changements de cette image : le port à suivre si le
+        // protocole ou le chiffrement change.
+        let default_port = editor.session.default_port();
+        let ftp = editor.session.is_ftp();
 
         theme::modal(ctx, Id::unique("editor")).show(ctx, |ui| {
             ui.set_width(660.0);
-            ui.heading(if editor.is_new { "Nouvelle session SSH" } else { "Modifier la session" });
+            ui.heading(if editor.is_new { "Nouvelle session" } else { "Modifier la session" });
             ui.add_space(6.0);
             editor.selected = editor.selected.min(editor.profiles.len().saturating_sub(1));
             let active = editor.active;
@@ -3191,7 +3273,7 @@ impl FerroApp {
                             }
                             let response = ui
                                 .selectable_label(index == editor.selected, job)
-                                .on_hover_text(form.profile.target());
+                                .on_hover_text(form.profile.target(default_port));
                             if response.clicked() {
                                 select = Some(index);
                             }
@@ -3227,6 +3309,41 @@ impl FerroApp {
                 // Session (commune à tous les profils), puis profil affiché.
                 ui.vertical(|ui| {
                     egui::Grid::new("editor_session").num_columns(2).spacing([10.0, 8.0]).min_col_width(110.0).show(ui, |ui| {
+                        use crate::session::{FtpTls, Protocol};
+                        ui.label("Protocole");
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut editor.session.protocol, Protocol::Ssh, "SSH")
+                                .on_hover_text("Terminal, fichiers (SFTP) et supervision du serveur.");
+                            ui.radio_value(&mut editor.session.protocol, Protocol::Sftp, "SFTP")
+                                .on_hover_text("Explorateur de fichiers seul, sans terminal, par SSH (clé ou mot de passe).");
+                            ui.radio_value(&mut editor.session.protocol, Protocol::Ftp, "FTP")
+                                .on_hover_text("Explorateur de fichiers seul, sans terminal.");
+                        });
+                        ui.end_row();
+                        if ftp {
+                            ui.label("Chiffrement");
+                            let tls = &mut editor.session.ftp.tls;
+                            egui::ComboBox::from_id_salt("ftp_tls")
+                                .selected_text(tls.label())
+                                .width(300.0)
+                                .show_ui(ui, |ui| {
+                                    for choice in FtpTls::ALL {
+                                        ui.selectable_value(tls, choice, choice.label());
+                                    }
+                                })
+                                .response
+                                .on_hover_text(
+                                    "« TLS si disponible » chiffre la connexion quand le serveur le permet, \
+                                     et se replie sinon sur FTP en clair (mot de passe compris).",
+                                );
+                            ui.end_row();
+                            ui.label("Transferts");
+                            ui.checkbox(&mut editor.session.ftp.active_mode, "Mode actif").on_hover_text(
+                                "Le serveur se connecte au poste pour chaque transfert. À cocher seulement \
+                                 si le mode passif (par défaut) échoue : il est souvent bloqué par les pare-feu.",
+                            );
+                            ui.end_row();
+                        }
                         ui.label("Nom");
                         ui.add(
                             egui::TextEdit::singleline(&mut editor.session.name)
@@ -3295,17 +3412,24 @@ impl FerroApp {
                         ui.label("Utilisateur");
                         ui.add(
                             egui::TextEdit::singleline(&mut form.profile.username)
-                                .hint_text("demandé à la connexion si vide")
+                                .hint_text(if ftp {
+                                    "demandé si vide ; « anonymous » pour un accès anonyme"
+                                } else {
+                                    "demandé à la connexion si vide"
+                                })
                                 .desired_width(300.0),
                         );
                         ui.end_row();
-                        ui.label("Authentification");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut form.use_key, false, "Mot de passe");
-                            ui.radio_value(&mut form.use_key, true, "Clé privée");
-                        });
-                        ui.end_row();
-                        if form.use_key {
+                        // FTP : mot de passe seulement.
+                        if !ftp {
+                            ui.label("Authentification");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut form.use_key, false, "Mot de passe");
+                                ui.radio_value(&mut form.use_key, true, "Clé privée");
+                            });
+                            ui.end_row();
+                        }
+                        if form.use_key && !ftp {
                             ui.label("Clé");
                             ui.horizontal(|ui| {
                                 let key = form.profile.key_path.get_or_insert_with(String::new);
@@ -3386,6 +3510,7 @@ impl FerroApp {
             self.editor = None;
             return;
         }
+        editor.follow_default_port(default_port);
         if let Some(index) = select {
             editor.selected = index;
         }
@@ -3422,12 +3547,16 @@ impl FerroApp {
                     self.store.update(session.clone());
                     // Les onglets ouverts reprennent les nouveaux réglages de leur
                     // profil à la reconnexion (le profil actif si le leur a disparu).
+                    // Un onglet ouvert garde son protocole : son contenu (terminal ou
+                    // explorateur) en dépend. Le nouveau vaut pour les prochains onglets.
                     for tab in self.tabs.iter_mut().filter(|t| t.target.session_id() == Some(session.id)) {
-                        let mut updated = session.clone();
-                        if let Target::Ssh(old) = &tab.target {
-                            updated.switch_profile(old.profile);
+                        let Target::Remote(old) = &tab.target else { continue };
+                        if old.protocol != session.protocol {
+                            continue;
                         }
-                        tab.target = Target::Ssh(updated);
+                        let mut updated = session.clone();
+                        updated.switch_profile(old.profile);
+                        tab.target = Target::Remote(updated);
                     }
                 }
                 self.save_store();
@@ -3708,7 +3837,7 @@ impl FerroApp {
             ui.label(dim("Ouvrez une session SSH pour superviser le serveur."));
             return;
         };
-        if !matches!(tab.target, Target::Ssh(_)) {
+        if !tab.target.is_ssh() {
             ui.label(dim("La supervision concerne les sessions SSH."));
             return;
         }
@@ -3878,7 +4007,7 @@ impl FerroApp {
         let mut list = vec![
             TitleAction {
                 icon: TitleIcon::Font(&theme::ICON_ADD),
-                tooltip: "Nouvelle session SSH",
+                tooltip: "Nouvelle session (SSH, SFTP, FTP)",
                 active: false,
                 action: Action::NewSession,
             },
@@ -4276,7 +4405,7 @@ impl FerroApp {
         if !matches!(tab.sftp.available, Some(Ok(()))) || tab.sftp.cwd.is_empty() {
             self.notice = Some((
                 "Envoi impossible".into(),
-                "Ouvrez une session avec SFTP disponible avant de déposer des fichiers.".into(),
+                "Ouvrez une session SSH (avec SFTP) ou FTP avant de déposer des fichiers.".into(),
             ));
             return;
         }
@@ -4326,8 +4455,8 @@ impl ProfileForm {
         }
     }
 
-    /// Profil vérifié, prêt à enregistrer.
-    fn validate(&self) -> Result<crate::session::Profile, String> {
+    /// Profil vérifié, prêt à enregistrer. En FTP, la clé est ignorée.
+    fn validate(&self, ftp: bool) -> Result<crate::session::Profile, String> {
         let mut p = self.profile.clone();
         p.name = p.name.trim().to_string();
         p.host = p.host.trim().to_string();
@@ -4342,7 +4471,7 @@ impl ProfileForm {
             Ok(port) if port != 0 => port,
             _ => return Err("Le port doit être un nombre entre 1 et 65535.".into()),
         };
-        p.key_path = if self.use_key {
+        p.key_path = if self.use_key && !ftp {
             let key = p.key_path.unwrap_or_default().trim().to_string();
             if key.is_empty() {
                 return Err("Choisissez une clé privée, ou l'authentification par mot de passe.".into());
@@ -4395,6 +4524,20 @@ impl Editor {
         self.error = None;
     }
 
+    /// Protocole ou chiffrement changé : les profils qui utilisaient le port
+    /// habituel (`previous`) passent au nouveau (ex. 22 → 21 pour FTP).
+    fn follow_default_port(&mut self, previous: u16) {
+        let port = self.session.default_port();
+        if port == previous {
+            return;
+        }
+        for form in &mut self.profiles {
+            if form.port.trim() == previous.to_string() {
+                form.port = port.to_string();
+            }
+        }
+    }
+
     /// Supprime un profil (jamais le dernier). Le profil actif supprimé est
     /// remplacé par le premier restant.
     fn remove_profile(&mut self, index: usize) {
@@ -4418,8 +4561,9 @@ impl Editor {
     /// celui-ci est affiché.
     fn validate(&mut self) -> Result<Session, String> {
         let mut profiles = Vec::new();
+        let ftp = self.session.is_ftp();
         for (index, form) in self.profiles.iter().enumerate() {
-            match form.validate() {
+            match form.validate(ftp) {
                 Ok(profile) => profiles.push(profile),
                 Err(e) => {
                     self.selected = index;
@@ -4482,6 +4626,36 @@ impl FolderNode {
         node.sessions.push(session.clone());
         node.sessions.sort_by_key(|s| s.name.to_lowercase());
     }
+}
+
+/// État de la connexion d'un onglet : pastille flottante, centrée en bas de
+/// `area`. Renvoie (reconnecter, fermer l'onglet), cliqués dans la pastille.
+fn connection_pill(ui: &mut egui::Ui, tab: &Tab, area: egui::Rect) -> (bool, bool) {
+    let (mut reconnect, mut close) = (false, false);
+    let pill = Id::unique(("status", tab.id));
+    match &tab.state {
+        TabState::Connecting(message) => {
+            theme::status_pill(ui, pill, area, |ui| {
+                ui.spinner();
+                ui.label(message);
+            });
+        }
+        TabState::Closed(message) => {
+            theme::status_pill(ui, pill, area, |ui| {
+                theme::status_dot(ui, theme::p().red);
+                ui.label(message);
+                ui.add_space(6.0);
+                if theme::primary_button(ui, &theme::label(&theme::ICON_REFRESH, "Reconnecter")).clicked() {
+                    reconnect = true;
+                }
+                if theme::header_button(ui, &theme::ICON_CLOSE, "Fermer l'onglet").clicked() {
+                    close = true;
+                }
+            });
+        }
+        TabState::Connected => {}
+    }
+    (reconnect, close)
 }
 
 fn parent_dir(path: &str) -> String {

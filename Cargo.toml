@@ -2,7 +2,7 @@
 name = "ferroterm"
 version = "0.1.0"
 edition = "2024"
-description = "Client SSH à onglets avec gestionnaire de sessions et explorateur SFTP"
+description = "Client SSH et FTP à onglets avec gestionnaire de sessions et explorateur de fichiers"
 
 # Paquet Debian/Ubuntu : `cargo deb` (voir `cargo install cargo-deb`).
 [package.metadata.deb]
@@ -32,6 +32,15 @@ rfd = "0.18"
 # Moteur cryptographique `ring` : compile avec MSVC seul (aws-lc demande NASM et CMake).
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3"
+# FTP/FTPS. Même contrainte que russh : TLS avec `ring`, jamais aws-lc.
+suppaftp = { version = "13", default-features = false, features = ["tokio", "tokio-rustls-ring", "deprecated"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Autorités de certification : celles du système (CA d'entreprise) et celles de Mozilla.
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+# Empreinte SHA-256 des certificats FTPS (déjà utilisé par russh).
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "fs", "macros", "net"] }

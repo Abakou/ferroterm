@@ -1,5 +1,6 @@
 //! Connexions SSH : une tâche tokio par onglet, qui pilote le terminal distant
-//! et une session SFTP sur un second canal.
+//! et une session SFTP sur un second canal. Les connexions FTP (`ftp.rs`)
+//! utilisent les mêmes canaux et les mêmes commandes de fichiers.
 //!
 //! L'interface communique avec la tâche par trois canaux :
 //! - `Command` (interface → connexion) : saisie clavier, redimensionnement, SFTP ;
@@ -28,7 +29,7 @@ use crate::vault;
 pub type SharedParser = Arc<Mutex<vt100::Parser>>;
 
 const SCROLLBACK_LINES: usize = 3000;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const SFTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum Command {
@@ -62,6 +63,10 @@ pub enum Reply {
 pub enum Event {
     Status(String),
     AskHostKey { algorithm: String, fingerprint: String },
+    /// Certificat TLS non reconnu (FTPS) : `reason` dit pourquoi, `changed`
+    /// qu'un autre certificat avait été approuvé pour ce serveur. La réponse
+    /// est un `Reply::HostKey`.
+    AskCertificate { reason: String, fingerprint: String, changed: bool },
     /// `remember` : propose d'enregistrer la réponse dans le coffre du système
     /// (valeur initiale de la case), `None` = pas de case.
     AskText { prompt: String, secret: bool, remember: Option<bool> },
@@ -190,20 +195,20 @@ impl UiLink {
         self.ctx.request_repaint();
     }
 
-    fn status(&self, text: impl Into<String>) {
+    pub fn status(&self, text: impl Into<String>) {
         self.send(Event::Status(text.into()));
     }
 }
 
-type Replies = Arc<AsyncMutex<mpsc::UnboundedReceiver<Reply>>>;
+pub(crate) type Replies = Arc<AsyncMutex<mpsc::UnboundedReceiver<Reply>>>;
 
-async fn ask_text(ui: &UiLink, replies: &Replies, prompt: &str, secret: bool) -> anyhow::Result<Option<String>> {
+pub(crate) async fn ask_text(ui: &UiLink, replies: &Replies, prompt: &str, secret: bool) -> anyhow::Result<Option<String>> {
     Ok(ask(ui, replies, prompt, secret, None).await?.map(|(text, _)| text))
 }
 
 /// Demande un secret en proposant de l'enregistrer (case cochée si `remember`).
 /// Renvoie le secret et l'état de la case, ou `None` si annulé.
-async fn ask_secret(ui: &UiLink, replies: &Replies, prompt: &str, remember: bool) -> anyhow::Result<Option<(String, bool)>> {
+pub(crate) async fn ask_secret(ui: &UiLink, replies: &Replies, prompt: &str, remember: bool) -> anyhow::Result<Option<(String, bool)>> {
     ask(ui, replies, prompt, true, Some(remember)).await
 }
 
@@ -228,7 +233,7 @@ async fn ask(
 
 /// Après une saisie réussie : enregistre le secret si la case est cochée,
 /// sinon supprime l'ancien s'il venait d'être refusé (il est périmé).
-fn update_vault(ui: &UiLink, secret: &vault::Secret, user: &str, value: &str, remember: bool, stale: bool) {
+pub(crate) fn update_vault(ui: &UiLink, secret: &vault::Secret, user: &str, value: &str, remember: bool, stale: bool) {
     if remember {
         if let Err(e) = vault::set(secret, user, value) {
             ui.status(format!("Non enregistré : {e:#}"));
@@ -321,6 +326,9 @@ async fn run(
     if !authenticate(&mut handle, &user, &session, &ui, &replies).await? {
         bail!("authentification refusée");
     }
+    if !session.has_terminal() {
+        return files_only(handle, ui, commands).await;
+    }
 
     ui.status("Ouverture du terminal…");
     let channel = handle.channel_open_session().await?;
@@ -373,6 +381,45 @@ async fn run(
                     let _ = writer.close().await;
                     break;
                 }
+            },
+        }
+    }
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "fr").await;
+    Ok(())
+}
+
+/// Session SFTP seule : ni terminal ni supervision, l'explorateur seulement.
+/// Sans SFTP, la session n'a pas d'objet : le refus du serveur y met fin.
+async fn files_only(
+    handle: client::Handle<Handler>,
+    ui: UiLink,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+) -> anyhow::Result<()> {
+    ui.status("Ouverture de SFTP…");
+    let sftp = match tokio::time::timeout(SFTP_TIMEOUT, open_sftp(&handle)).await {
+        Ok(Ok(sftp)) => sftp,
+        Ok(Err(e)) => bail!("SFTP refusé par le serveur ({})", describe_error(&e)),
+        Err(_) => bail!("SFTP : le serveur ne répond pas"),
+    };
+    let home = sftp.canonicalize(".").await.unwrap_or_else(|_| "/".into());
+    ui.send(Event::Connected);
+    ui.send(Event::SftpReady { home });
+    let (sftp_tx, sftp_rx) = mpsc::unbounded_channel();
+    tokio::spawn(sftp_worker(Arc::new(sftp), sftp_rx, ui.clone()));
+
+    // Sans canal de terminal, rien ne signale une connexion perdue (keepalive
+    // sans réponse, serveur arrêté) : on la surveille.
+    let mut check = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            cmd = commands.recv() => match cmd {
+                Some(Command::Sftp(c)) => { let _ = sftp_tx.send(c); }
+                // Pas de terminal : saisie et redimensionnement sont sans objet.
+                Some(Command::Input(_)) | Some(Command::Resize { .. }) => {}
+                Some(Command::Disconnect) | None => break,
+            },
+            _ = check.tick() => if handle.is_closed() {
+                bail!("connexion perdue");
             },
         }
     }
@@ -740,7 +787,7 @@ async fn save_edited(
     }
 }
 
-async fn copy_with_progress<R, W>(
+pub(crate) async fn copy_with_progress<R, W>(
     source: &mut R,
     target: &mut W,
     update: &mut TransferUpdate,
@@ -767,7 +814,7 @@ where
     }
 }
 
-fn finish_transfer(mut update: TransferUpdate, result: anyhow::Result<()>, ui: &UiLink) -> Option<String> {
+pub(crate) fn finish_transfer(mut update: TransferUpdate, result: anyhow::Result<()>, ui: &UiLink) -> Option<String> {
     update.finished = true;
     update.error = result.err().map(|e| describe_error(&e));
     let error = update.error.clone();
@@ -775,7 +822,7 @@ fn finish_transfer(mut update: TransferUpdate, result: anyhow::Result<()>, ui: &
     error
 }
 
-fn describe_error(error: &anyhow::Error) -> String {
+pub(crate) fn describe_error(error: &anyhow::Error) -> String {
     if let Some(russh::Error::UnknownKey) = error.downcast_ref::<russh::Error>() {
         return "clé de l'hôte refusée".into();
     }

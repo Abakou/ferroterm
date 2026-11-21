@@ -3,6 +3,7 @@
 
 mod app;
 mod edit;
+mod ftp;
 mod highlight;
 mod local;
 mod mobaxterm;

@@ -1,8 +1,72 @@
-//! Sessions SSH enregistrées et leur stockage sur disque (JSON).
+//! Sessions (SSH ou FTP) enregistrées et leur stockage sur disque (JSON).
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// Protocole d'une session.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// Terminal, explorateur SFTP et supervision.
+    #[default]
+    Ssh,
+    /// Explorateur de fichiers seul, sans terminal, par SSH.
+    Sftp,
+    /// Explorateur de fichiers seul, sans terminal.
+    Ftp,
+}
+
+impl Protocol {
+    fn is_ssh(&self) -> bool {
+        *self == Protocol::Ssh
+    }
+}
+
+/// Chiffrement d'une session FTP.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FtpTls {
+    /// TLS explicite (AUTH TLS) si le serveur le propose, FTP en clair sinon
+    /// (comme FileZilla).
+    #[default]
+    Auto,
+    /// TLS explicite obligatoire : pas de repli en clair.
+    Required,
+    /// TLS dès la connexion (port 990 en général).
+    Implicit,
+    /// FTP en clair : mot de passe et fichiers circulent sans chiffrement.
+    Off,
+}
+
+impl FtpTls {
+    pub const ALL: [FtpTls; 4] = [FtpTls::Auto, FtpTls::Required, FtpTls::Implicit, FtpTls::Off];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FtpTls::Auto => "TLS si disponible (recommandé)",
+            FtpTls::Required => "TLS explicite obligatoire (FTPS)",
+            FtpTls::Implicit => "TLS implicite (FTPS, port 990)",
+            FtpTls::Off => "Aucun (FTP en clair)",
+        }
+    }
+}
+
+/// Réglages propres aux sessions FTP.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FtpOptions {
+    #[serde(default)]
+    pub tls: FtpTls,
+    /// Mode actif (le serveur se connecte au client) ; passif par défaut.
+    #[serde(default)]
+    pub active_mode: bool,
+}
+
+impl FtpOptions {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
@@ -11,6 +75,12 @@ pub struct Session {
     /// Dossier de rangement, segments séparés par `/`. Vide = racine.
     #[serde(default)]
     pub folder: String,
+    /// Absent des anciens fichiers : SSH.
+    #[serde(default, skip_serializing_if = "Protocol::is_ssh")]
+    pub protocol: Protocol,
+    /// Réglages FTP, communs à tous les profils (ignorés en SSH).
+    #[serde(default, skip_serializing_if = "FtpOptions::is_default")]
+    pub ftp: FtpOptions,
     pub host: String,
     pub port: u16,
     /// Vide = demandé à la connexion.
@@ -46,15 +116,25 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// `utilisateur@hôte[:port]`, pour l'affichage.
-    pub fn target(&self) -> String {
-        target(&self.username, &self.host, self.port)
+    /// `utilisateur@hôte[:port]`, pour l'affichage ; le port est omis s'il
+    /// vaut `default_port` (celui du protocole de la session).
+    pub fn target(&self, default_port: u16) -> String {
+        target(&self.username, &self.host, self.port, default_port)
     }
 }
 
-fn target(username: &str, host: &str, port: u16) -> String {
+fn target(username: &str, host: &str, port: u16, default_port: u16) -> String {
     let user = if username.is_empty() { String::new() } else { format!("{username}@") };
-    if port == 22 { format!("{user}{host}") } else { format!("{user}{host}:{port}") }
+    if port == default_port { format!("{user}{host}") } else { format!("{user}{host}:{port}") }
+}
+
+/// Port habituel d'un protocole.
+pub fn default_port(protocol: Protocol, tls: FtpTls) -> u16 {
+    match (protocol, tls) {
+        (Protocol::Ssh | Protocol::Sftp, _) => 22,
+        (Protocol::Ftp, FtpTls::Implicit) => 990,
+        (Protocol::Ftp, _) => 21,
+    }
 }
 
 /// Nom du profil créé avec chaque session.
@@ -132,7 +212,31 @@ impl Session {
 
     /// `utilisateur@hôte[:port]` du profil actif, pour l'affichage.
     pub fn target(&self) -> String {
-        target(&self.username, &self.host, self.port)
+        target(&self.username, &self.host, self.port, self.default_port())
+    }
+
+    /// Port habituel du protocole de la session.
+    pub fn default_port(&self) -> u16 {
+        default_port(self.protocol, self.ftp.tls)
+    }
+
+    pub fn is_ftp(&self) -> bool {
+        self.protocol == Protocol::Ftp
+    }
+
+    /// Session avec terminal (SSH) ; sinon l'explorateur de fichiers occupe l'onglet.
+    pub fn has_terminal(&self) -> bool {
+        self.protocol == Protocol::Ssh
+    }
+
+    /// Nom court du protocole, pour l'affichage (« FTPS » si chiffré d'office).
+    pub fn protocol_label(&self) -> &'static str {
+        match (self.protocol, self.ftp.tls) {
+            (Protocol::Ssh, _) => "SSH",
+            (Protocol::Sftp, _) => "SFTP",
+            (Protocol::Ftp, FtpTls::Required | FtpTls::Implicit) => "FTPS",
+            (Protocol::Ftp, _) => "FTP",
+        }
     }
 }
 
@@ -177,7 +281,7 @@ impl Macro {
 pub struct SavedTab {
     /// Groupe d'onglets (scission), de gauche à droite à partir de 0.
     pub group: usize,
-    /// Session SSH (par id) ; `None` = terminal local.
+    /// Session SSH ou FTP (par id) ; `None` = terminal local.
     #[serde(default)]
     pub session: Option<u64>,
     /// Profil de connexion utilisé par l'onglet ; `None` = profil actif.
@@ -636,5 +740,40 @@ mod tests {
         assert_eq!(s.target(), "alice@example.org");
         s.port = 2222;
         assert_eq!(s.target(), "alice@example.org:2222");
+
+        // FTP : le port habituel dépend du chiffrement.
+        s.protocol = Protocol::Ftp;
+        s.port = 21;
+        assert_eq!(s.target(), "alice@example.org");
+        s.ftp.tls = FtpTls::Implicit;
+        assert_eq!(s.target(), "alice@example.org:21");
+        s.port = 990;
+        assert_eq!(s.target(), "alice@example.org");
+        assert_eq!(s.protocol_label(), "FTPS");
+
+        // SFTP seul : port de SSH.
+        s.protocol = Protocol::Sftp;
+        assert_eq!(s.target(), "alice@example.org:990");
+        s.port = 22;
+        assert_eq!(s.target(), "alice@example.org");
+        assert_eq!((s.protocol_label(), s.has_terminal()), ("SFTP", false));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""protocol":"sftp""#), "{json}");
+    }
+
+    #[test]
+    fn protocol_defaults_to_ssh_and_is_omitted_from_json() {
+        // Fichier écrit par une version sans FTP.
+        let old: Session = serde_json::from_str(r#"{"id":1,"name":"x","host":"h","port":22}"#).unwrap();
+        assert_eq!((old.protocol, old.ftp.clone()), (Protocol::Ssh, FtpOptions::default()));
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("protocol") && !json.contains("ftp"), "{json}");
+
+        let mut ftp = old;
+        ftp.protocol = Protocol::Ftp;
+        ftp.ftp.tls = FtpTls::Implicit;
+        let json = serde_json::to_string(&ftp).unwrap();
+        assert!(json.contains(r#""protocol":"ftp""#) && json.contains(r#""tls":"implicit""#), "{json}");
+        assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), ftp);
     }
 }
