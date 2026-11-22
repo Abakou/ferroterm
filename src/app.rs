@@ -8,7 +8,7 @@ use eframe::egui::{self, Color32, Id, Key, RichText};
 
 use crate::local::{self, LocalShell};
 use crate::mobaxterm;
-use crate::session::{Arrangement, Macro, Session, SessionStore};
+use crate::session::{Arrangement, Macro, Session, SessionExport, SessionStore};
 
 /// Nombre de colonnes d'une grille de `count` groupes.
 fn grid_columns(count: usize) -> usize {
@@ -66,6 +66,8 @@ pub struct FerroApp {
     selected_session: Option<u64>,
     editor: Option<Editor>,
     group_editor: Option<GroupEditor>,
+    export_dialog: Option<ExportDialog>,
+    import_unlock: Option<ImportUnlock>,
     notice: Option<(String, String)>,
     confirm: Option<Confirm>,
     mkdir_name: Option<String>,
@@ -224,6 +226,25 @@ struct GroupEditor {
     /// Groupe parent (vide = racine).
     parent: String,
     name: String,
+    error: Option<String>,
+}
+
+/// Export de sessions en préparation : avec ou sans les secrets.
+struct ExportDialog {
+    /// Groupe exporté (vide = toutes les sessions).
+    folder: String,
+    /// Joindre clés privées, phrases de passe et mots de passe, chiffrés.
+    with_secrets: bool,
+    password: String,
+    confirm: String,
+    error: Option<String>,
+}
+
+/// Fichier d'import contenant des secrets chiffrés : mot de passe demandé.
+struct ImportUnlock {
+    export: SessionExport,
+    path: PathBuf,
+    password: String,
     error: Option<String>,
 }
 
@@ -460,6 +481,8 @@ impl FerroApp {
             selected_session: None,
             editor: None,
             group_editor: None,
+            export_dialog: None,
+            import_unlock: None,
             notice: warning.map(|w| ("Sessions".to_string(), w)),
             confirm: None,
             mkdir_name: None,
@@ -923,7 +946,15 @@ impl FerroApp {
             }
             Action::AskDeleteGroup(path) => self.confirm = Some(Confirm::DeleteGroup(path)),
             Action::Import => self.import_mobaxterm(),
-            Action::ExportSessions(folder) => self.export_sessions(&folder),
+            Action::ExportSessions(folder) => {
+                self.export_dialog = Some(ExportDialog {
+                    folder,
+                    with_secrets: false,
+                    password: String::new(),
+                    confirm: String::new(),
+                    error: None,
+                });
+            }
             Action::ImportSessions => self.import_sessions(),
             Action::ToggleSessions => self.sessions_visible = !self.sessions_visible,
             Action::ShowSide(view) => {
@@ -1009,20 +1040,24 @@ impl FerroApp {
     }
 
     /// Enregistre les sessions (toutes, ou celles d'un groupe) dans un fichier
-    /// JSON, relisible par « Importer des sessions ».
-    fn export_sessions(&mut self, folder: &str) {
-        let export = self.store.export(folder);
+    /// JSON, relisible par « Importer des sessions ». Avec un mot de passe, les
+    /// clés privées et les secrets du coffre y sont joints, chiffrés.
+    fn export_sessions(&mut self, folder: &str, password: Option<&str>) {
+        let mut export = self.store.export(folder);
         if export.sessions.is_empty() && export.folders.is_empty() {
             self.notice = Some(("Export".into(), "Aucune session à exporter.".into()));
             return;
         }
-        let stem = if folder.is_empty() {
+        let mut stem = if folder.is_empty() {
             "sessions-ferroterm".to_string()
         } else {
             let name = folder.replace('/', "-");
             let name: String = name.chars().map(|c| if r#"\:*?"<>|"#.contains(c) { '_' } else { c }).collect();
             format!("sessions-ferroterm-{name}")
         };
+        if password.is_some() {
+            stem.push_str("-avec-secrets");
+        }
         let Some(path) = rfd::FileDialog::new()
             .set_title(if folder.is_empty() { "Exporter les sessions".to_string() } else { format!("Exporter le groupe {folder}") })
             .set_file_name(format!("{stem}.json"))
@@ -1031,22 +1066,49 @@ impl FerroApp {
         else {
             return;
         };
-        let result = export.to_json().and_then(|text| Ok(std::fs::write(&path, text)?));
-        self.notice = Some(match result {
-            Ok(()) => (
-                "Sessions exportées".into(),
-                format!(
-                    "{} session(s) et {} groupe(s) enregistrés dans {}\n\nLes mots de passe ne sont pas exportés : ils restent dans le coffre du système de ce poste. Les chemins des clés privées sont exportés tels quels.",
-                    export.sessions.len(),
-                    export.folders.len(),
-                    path.display()
-                ),
+        let mut included = None;
+        let result = (|| -> anyhow::Result<()> {
+            if let Some(password) = password {
+                let collected = crate::bundle::collect(&export.sessions);
+                export.secrets = Some(crate::bundle::seal(&collected.secrets, password)?);
+                included = Some(collected);
+            }
+            std::fs::write(&path, export.to_json()?)?;
+            Ok(())
+        })();
+        let mut body = format!(
+            "{} session(s) et {} groupe(s) enregistrés dans {}",
+            export.sessions.len(),
+            export.folders.len(),
+            path.display()
+        );
+        match &included {
+            None => body.push_str(
+                "\n\nLes mots de passe ne sont pas exportés : ils restent dans le coffre du système de ce poste. Les chemins des clés privées sont exportés tels quels.",
             ),
+            Some(collected) => {
+                body.push_str(&format!(
+                    "\n\nJoints au fichier, chiffrés par votre mot de passe :\n• {} clé(s) privée(s), avec leur phrase de passe si elle est enregistrée\n• {} mot(s) de passe de session",
+                    collected.secrets.keys.len(),
+                    collected.secrets.passwords.len()
+                ));
+                if !collected.missing.is_empty() {
+                    body.push_str("\n\nClés illisibles, non jointes :");
+                    for (key, reason) in &collected.missing {
+                        body.push_str(&format!("\n    – {key} : {reason}"));
+                    }
+                }
+                body.push_str("\n\nGardez ce fichier en lieu sûr : avec son mot de passe, il ouvre l'accès à vos serveurs.");
+            }
+        }
+        self.notice = Some(match result {
+            Ok(()) => ("Sessions exportées".into(), body),
             Err(e) => ("Export impossible".into(), format!("{}: {e:#}", path.display())),
         });
     }
 
-    /// Recharge un fichier créé par « Exporter les sessions ».
+    /// Recharge un fichier créé par « Exporter les sessions ». S'il contient
+    /// des secrets, leur mot de passe est d'abord demandé.
     fn import_sessions(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Importer des sessions Ferroterm")
@@ -1057,24 +1119,88 @@ impl FerroApp {
         };
         let export = std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|text| crate::session::SessionExport::from_json(&text));
-        let export = match export {
-            Ok(export) => export,
-            Err(e) => {
-                self.notice = Some(("Import impossible".into(), format!("{}: {e:#}", path.display())));
-                return;
+            .and_then(|text| SessionExport::from_json(&text));
+        match export {
+            Ok(export) if export.secrets.is_some() => {
+                self.import_unlock = Some(ImportUnlock { export, path, password: String::new(), error: None });
             }
-        };
+            Ok(export) => self.finish_import(export, &path, None),
+            Err(e) => self.notice = Some(("Import impossible".into(), format!("{}: {e:#}", path.display()))),
+        }
+    }
+
+    /// Importe les sessions et, s'ils ont été déchiffrés, leurs secrets : clés
+    /// privées copiées à côté du fichier de sessions, mots de passe et phrases
+    /// de passe enregistrés dans le coffre du système.
+    fn finish_import(&mut self, mut export: SessionExport, path: &std::path::Path, secrets: Option<crate::bundle::Secrets>) {
+        use crate::vault::{self, Secret};
+        let skipped_secrets = export.secrets.take().is_some() && secrets.is_none();
+        let mut problems: Vec<String> = Vec::new();
+        let mut keys_installed: Option<(usize, String)> = None;
+        if let Some(secrets) = secrets.as_ref().filter(|s| !s.keys.is_empty()) {
+            let installed =
+                crate::bundle::keys_dir().ok_or_else(|| anyhow::anyhow!("aucun dossier de configuration")).and_then(|dir| {
+                    let paths = crate::bundle::install_keys(&secrets.keys, &dir)?;
+                    Ok((paths, dir))
+                });
+            match installed {
+                Ok((paths, dir)) => {
+                    for key in &secrets.keys {
+                        let (Some(passphrase), Some(local)) = (&key.passphrase, paths.get(&key.path)) else { continue };
+                        if let Err(e) = vault::set(&Secret::Passphrase(local.clone()), "", passphrase) {
+                            problems.push(format!("Phrase de passe de {} non enregistrée : {e:#}", key.name));
+                        }
+                    }
+                    export.replace_key_paths(&paths);
+                    keys_installed = Some((secrets.keys.len(), dir.display().to_string()));
+                }
+                Err(e) => problems.push(format!("Clés privées non enregistrées : {e:#}")),
+            }
+        }
+
         let found = export.sessions.len();
-        let (added, duplicates) = self.store.import(export);
+        let report = self.store.import(export);
         self.save_store();
-        self.notice = Some((
-            "Import de sessions".into(),
-            format!(
-                "{found} session(s) trouvée(s) dans {}\n\n• {added} importée(s)\n• {duplicates} déjà présente(s) (même groupe et même nom)\n\nLes mots de passe ne font pas partie de l'export : ils seront demandés à la connexion.",
-                path.display()
-            ),
-        ));
+
+        let mut passwords = 0;
+        for entry in secrets.iter().flat_map(|s| &s.passwords) {
+            let Some(&(_, id)) = report.added.iter().find(|(original, _)| *original == entry.session) else {
+                continue; // session déjà présente : ses réglages et secrets sont gardés
+            };
+            let Some(profile) = self.store.get(id).and_then(|s| s.profiles().into_iter().find(|p| p.id == entry.profile))
+            else {
+                continue;
+            };
+            match vault::set(&Secret::Password(id, profile.id), &profile.username, &entry.password) {
+                Ok(()) => passwords += 1,
+                Err(e) => problems.push(format!("Mot de passe non enregistré : {e:#}")),
+            }
+        }
+
+        let mut body = format!(
+            "{found} session(s) trouvée(s) dans {}\n\n• {} importée(s)\n• {} déjà présente(s) (même groupe et même nom)",
+            path.display(),
+            report.added.len(),
+            report.duplicates
+        );
+        if secrets.is_some() {
+            if let Some((count, dir)) = &keys_installed {
+                body.push_str(&format!("\n• {count} clé(s) privée(s) copiée(s) dans {dir}"));
+            }
+            body.push_str(&format!("\n• {passwords} mot(s) de passe enregistré(s) dans le coffre du système"));
+            if report.duplicates > 0 {
+                body.push_str("\n\nLes sessions déjà présentes gardent leurs réglages et leurs mots de passe.");
+            }
+        } else if skipped_secrets {
+            body.push_str("\n\nSecrets non importés : les mots de passe seront demandés à la connexion, et les chemins des clés privées sont ceux du poste d'origine.");
+        } else {
+            body.push_str("\n\nLes mots de passe ne font pas partie de l'export : ils seront demandés à la connexion.");
+        }
+        problems.dedup();
+        for problem in problems {
+            body.push_str(&format!("\n\nAttention : {problem}"));
+        }
+        self.notice = Some(("Import de sessions".into(), body));
     }
 
     fn import_mobaxterm(&mut self) {
@@ -1101,7 +1227,8 @@ impl FerroApp {
         };
         let result = mobaxterm::parse(&mobaxterm::decode(&bytes), &profile, &drive);
         let found = result.sessions.len();
-        let (added, duplicates) = self.store.merge(result.sessions);
+        let report = self.store.merge(result.sessions);
+        let (added, duplicates) = (report.added.len(), report.duplicates);
         self.save_store();
 
         let mut body = format!(
@@ -2746,6 +2873,8 @@ impl FerroApp {
         self.prompt_dialog(ctx);
         self.editor_dialog(ctx);
         self.group_editor_dialog(ctx);
+        self.export_dialog(ctx);
+        self.import_unlock_dialog(ctx);
         self.macro_editor_dialog(ctx);
         self.edit_upload_dialog(ctx);
         self.highlight_editor_dialog(ctx);
@@ -3150,6 +3279,115 @@ impl FerroApp {
                 self.save_store();
             }
         }
+    }
+
+    /// Choix avant l'export : avec ou sans les secrets (et leur mot de passe).
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.export_dialog else { return };
+        let mut export = false;
+        let mut cancel = false;
+
+        theme::modal(ctx, Id::unique("export_dialog")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(if dialog.folder.is_empty() {
+                "Exporter les sessions".to_string()
+            } else {
+                format!("Exporter le groupe {}", dialog.folder)
+            });
+            ui.add_space(8.0);
+            ui.checkbox(&mut dialog.with_secrets, "Inclure les clés SSH et les mots de passe");
+            let help = if dialog.with_secrets {
+                "Les clés privées, leurs phrases de passe et les mots de passe enregistrés sont joints au fichier, chiffrés (AES-256) par le mot de passe ci-dessous. Il sera demandé à l'import, sur un autre poste ou sur Android."
+            } else {
+                "Sessions seules : les mots de passe seront demandés à la connexion et les clés privées devront être recopiées à la main."
+            };
+            ui.label(RichText::new(help).small().color(theme::p().text_dim));
+            if dialog.with_secrets {
+                ui.add_space(6.0);
+                ui.label("Mot de passe du fichier");
+                ui.add(egui::TextEdit::singleline(&mut dialog.password).password(true).desired_width(f32::INFINITY));
+                ui.label("Confirmation");
+                ui.add(egui::TextEdit::singleline(&mut dialog.confirm).password(true).desired_width(f32::INFINITY));
+            }
+            if let Some(error) = &dialog.error {
+                ui.colored_label(theme::p().red, error);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                export = theme::primary_button(ui, "Exporter…").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+                cancel = ui.button("Annuler").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+            });
+        });
+
+        if cancel {
+            self.export_dialog = None;
+            return;
+        }
+        if !export {
+            return;
+        }
+        if dialog.with_secrets {
+            if dialog.password.chars().count() < crate::bundle::MIN_PASSWORD_LEN {
+                dialog.error = Some(format!("Le mot de passe doit faire au moins {} caractères.", crate::bundle::MIN_PASSWORD_LEN));
+                return;
+            }
+            if dialog.password != dialog.confirm {
+                dialog.error = Some("Les deux mots de passe diffèrent.".into());
+                return;
+            }
+        }
+        let Some(dialog) = self.export_dialog.take() else { return };
+        let password = dialog.with_secrets.then_some(dialog.password.as_str());
+        self.export_sessions(&dialog.folder, password);
+    }
+
+    /// Mot de passe des secrets d'un fichier à importer.
+    fn import_unlock_dialog(&mut self, ctx: &egui::Context) {
+        let Some(unlock) = &mut self.import_unlock else { return };
+        let mut open = false;
+        let mut without = false;
+        let mut cancel = false;
+
+        theme::modal(ctx, Id::unique("import_unlock")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("Importer des sessions");
+            ui.label(RichText::new(unlock.path.display().to_string()).small().color(theme::p().text_dim));
+            ui.add_space(6.0);
+            ui.label("Ce fichier contient des clés SSH et des mots de passe chiffrés. Saisissez le mot de passe choisi à l'export.");
+            ui.add_space(6.0);
+            ui.add(egui::TextEdit::singleline(&mut unlock.password).password(true).desired_width(f32::INFINITY))
+                .request_focus();
+            if let Some(error) = &unlock.error {
+                ui.colored_label(theme::p().red, error);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                open = theme::primary_button(ui, "Importer").clicked() || ui.input(|i| i.key_pressed(Key::Enter));
+                without = ui.button("Sans les secrets").clicked();
+                cancel = ui.button("Annuler").clicked() || ui.input(|i| i.key_pressed(Key::Escape));
+            });
+        });
+
+        if cancel {
+            self.import_unlock = None;
+            return;
+        }
+        let secrets = if open {
+            let Some(sealed) = &unlock.export.secrets else { return };
+            match crate::bundle::open(sealed, &unlock.password) {
+                Ok(secrets) => Some(secrets),
+                Err(e) => {
+                    unlock.error = Some(format!("Import impossible : {e:#}."));
+                    return;
+                }
+            }
+        } else if without {
+            None
+        } else {
+            return;
+        };
+        let Some(unlock) = self.import_unlock.take() else { return };
+        self.finish_import(unlock.export, &unlock.path, secrets);
     }
 
     fn macro_editor_dialog(&mut self, ctx: &egui::Context) {

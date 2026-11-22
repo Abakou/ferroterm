@@ -23,6 +23,8 @@ assets = [
 [dependencies]
 anyhow = "1"
 arboard = "3"
+# Encodage des secrets chiffrés de l'export (déjà utilisé par russh).
+base64ct = { version = "1.8", features = ["alloc"] }
 diffy = "0.5.2"
 directories = "6"
 eframe = "0.37"

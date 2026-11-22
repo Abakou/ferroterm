@@ -332,7 +332,8 @@ pub struct Workspace {
 }
 
 /// Fichier d'export des sessions, relisible par « Importer des sessions ».
-/// Les mots de passe (coffre du système) n'y figurent pas.
+/// Les secrets (clés privées, mots de passe) n'y figurent que sur demande,
+/// chiffrés par un mot de passe : voir [`crate::bundle`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionExport {
     /// Toujours [`EXPORT_FORMAT`] : distingue ce fichier d'un JSON quelconque.
@@ -343,6 +344,10 @@ pub struct SessionExport {
     /// Groupes, y compris ceux qui n'ont aucune session.
     #[serde(default)]
     pub folders: Vec<String>,
+    /// Secrets chiffrés. Ignoré par les versions qui ne le connaissent pas :
+    /// elles importent alors les sessions seules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<crate::bundle::Sealed>,
 }
 
 pub const EXPORT_FORMAT: &str = "ferroterm-sessions";
@@ -360,6 +365,31 @@ impl SessionExport {
         }
         Ok(export)
     }
+
+    /// Remplace les chemins de clés privées (sessions et profils) d'après
+    /// `paths` (chemin d'origine → chemin local).
+    pub fn replace_key_paths(&mut self, paths: &std::collections::HashMap<String, String>) {
+        let replace = |key: &mut Option<String>| {
+            if let Some(new) = key.as_ref().and_then(|k| paths.get(k)) {
+                *key = Some(new.clone());
+            }
+        };
+        for session in &mut self.sessions {
+            replace(&mut session.key_path);
+            for profile in &mut session.profiles {
+                replace(&mut profile.key_path);
+            }
+        }
+    }
+}
+
+/// Bilan d'un import de sessions.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Sessions ajoutées : (identifiant d'origine, nouvel identifiant).
+    pub added: Vec<(u64, u64)>,
+    /// Sessions ignorées car déjà présentes (même groupe et même nom).
+    pub duplicates: usize,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -556,13 +586,12 @@ impl SessionStore {
             folders.push(folder.to_string());
         }
         folders.sort();
-        SessionExport { format: EXPORT_FORMAT.into(), version: 1, sessions, folders }
+        SessionExport { format: EXPORT_FORMAT.into(), version: 1, sessions, folders, secrets: None }
     }
 
     /// Importe un export : les groupes manquants sont créés, les sessions
-    /// déjà présentes (même dossier et même nom) ignorées. Renvoie
-    /// (ajoutées, déjà présentes).
-    pub fn import(&mut self, export: SessionExport) -> (usize, usize) {
+    /// déjà présentes (même dossier et même nom) ignorées.
+    pub fn import(&mut self, export: SessionExport) -> ImportReport {
         for folder in &export.folders {
             self.add_folder(folder);
         }
@@ -582,22 +611,22 @@ impl SessionStore {
     }
 
     /// Ajoute les sessions qui n'existent pas déjà (même dossier et même nom).
-    /// Renvoie (ajoutées, déjà présentes).
-    pub fn merge(&mut self, imported: Vec<Session>) -> (usize, usize) {
-        let (mut added, mut duplicates) = (0, 0);
+    pub fn merge(&mut self, imported: Vec<Session>) -> ImportReport {
+        let mut report = ImportReport::default();
         for session in imported {
             let exists = self
                 .sessions
                 .iter()
                 .any(|s| s.folder == session.folder && s.name == session.name);
             if exists {
-                duplicates += 1;
+                report.duplicates += 1;
             } else {
-                self.insert(session);
-                added += 1;
+                let original = session.id;
+                let id = self.insert(session);
+                report.added.push((original, id));
             }
         }
-        (added, duplicates)
+        report
     }
 }
 
@@ -619,12 +648,12 @@ mod tests {
     fn merge_skips_duplicates_and_assigns_ids() {
         let mut store = SessionStore::default();
         store.insert(session("prod", "web"));
-        let (added, dupes) = store.merge(vec![
+        let report = store.merge(vec![
             session("prod", "web"),
             session("prod", "db"),
             session("dev", "web"),
         ]);
-        assert_eq!((added, dupes), (2, 1));
+        assert_eq!((report.added.len(), report.duplicates), (2, 1));
         let mut ids: Vec<u64> = store.sessions.iter().map(|s| s.id).collect();
         ids.dedup();
         assert_eq!(ids.len(), 3);
@@ -690,13 +719,34 @@ mod tests {
         let text = store.export("").to_json().unwrap();
         let mut other = SessionStore::default();
         other.insert(session("Autre", "x"));
-        assert_eq!(other.import(SessionExport::from_json(&text).unwrap()), (2, 1));
+        assert!(!text.contains("secrets"), "{text}");
+        let report = other.import(SessionExport::from_json(&text).unwrap());
+        assert_eq!((report.added.len(), report.duplicates), (2, 1));
+        // Identifiants d'origine gardés pour retrouver les secrets de chaque session.
+        for (original, new) in report.added {
+            assert_eq!(store.get(original).map(|s| &s.name), other.get(new).map(|s| &s.name));
+        }
         assert!(other.has_folder("EFB/Vide"));
         let imported = other.sessions.iter().find(|s| s.name == "web").unwrap();
         assert_eq!((imported.host.as_str(), imported.profile_name()), ("prod", "Prod"));
 
         assert!(SessionExport::from_json("{\"sessions\": []}").is_err());
         assert!(SessionExport::from_json("{\"format\": \"autre\", \"version\": 1}").is_err());
+    }
+
+    #[test]
+    fn replace_key_paths_updates_sessions_and_profiles() {
+        let mut s = session("", "x");
+        s.key_path = Some("/old/id".into());
+        let mut all = s.profiles();
+        all.push(Profile { id: 1, name: "Prod".into(), key_path: Some("/old/id".into()), ..Default::default() });
+        all.push(Profile { id: 2, name: "Autre".into(), key_path: Some("/other".into()), ..Default::default() });
+        s.set_profiles(all, 0);
+        let mut export =
+            SessionExport { format: EXPORT_FORMAT.into(), version: 1, sessions: vec![s], folders: vec![], secrets: None };
+        export.replace_key_paths(&[("/old/id".to_string(), "/new/id".to_string())].into());
+        let keys: Vec<_> = export.sessions[0].profiles().into_iter().map(|p| p.key_path.unwrap()).collect();
+        assert_eq!(keys, vec!["/new/id", "/new/id", "/other"]);
     }
 
     #[test]
