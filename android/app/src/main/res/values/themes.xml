@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Thème de fenêtre minimal : l'apparence vient de Compose (Material 3). -->
+    <style name="Theme.Ferroterm" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

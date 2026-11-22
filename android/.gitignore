@@ -1,0 +1,17 @@
+# Gradle / Android Studio
+.gradle/
+.kotlin/
+build/
+/local.properties
+/captures/
+.externalNativeBuild/
+.cxx/
+*.iml
+.idea/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Signature de production
+/keystore.properties

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use eframe::egui::{self, Color32, Id, Key, RichText};
 
 use crate::local::{self, LocalShell};
-use crate::mobaxterm;
 use crate::session::{Arrangement, Macro, Session, SessionExport, SessionStore};
 
 /// Nombre de colonnes d'une grille de `count` groupes.
@@ -383,7 +382,6 @@ enum Action {
     /// Nouveau groupe de sessions, dans ce groupe parent (vide = racine).
     NewGroup(String),
     AskDeleteGroup(String),
-    Import,
     /// Exporte les sessions dans un fichier : toutes (vide), ou ce groupe.
     ExportSessions(String),
     /// Importe un fichier exporté par Ferroterm.
@@ -945,7 +943,6 @@ impl FerroApp {
                 self.group_editor = Some(GroupEditor { parent, name: String::new(), error: None });
             }
             Action::AskDeleteGroup(path) => self.confirm = Some(Confirm::DeleteGroup(path)),
-            Action::Import => self.import_mobaxterm(),
             Action::ExportSessions(folder) => {
                 self.export_dialog = Some(ExportDialog {
                     folder,
@@ -1201,48 +1198,6 @@ impl FerroApp {
             body.push_str(&format!("\n\nAttention : {problem}"));
         }
         self.notice = Some(("Import de sessions".into(), body));
-    }
-
-    fn import_mobaxterm(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Importer les sessions de MobaXterm")
-            .add_filter("MobaXterm.ini", &["ini"])
-            .pick_file()
-        else {
-            return;
-        };
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.notice = Some(("Import impossible".into(), format!("{}: {e}", path.display())));
-                return;
-            }
-        };
-        let profile = std::env::var("USERPROFILE").unwrap_or_default();
-        let path_text = path.to_string_lossy();
-        let drive = if path_text.as_bytes().get(1) == Some(&b':') {
-            path_text[..2].to_string()
-        } else {
-            String::new()
-        };
-        let result = mobaxterm::parse(&mobaxterm::decode(&bytes), &profile, &drive);
-        let found = result.sessions.len();
-        let report = self.store.merge(result.sessions);
-        let (added, duplicates) = (report.added.len(), report.duplicates);
-        self.save_store();
-
-        let mut body = format!(
-            "{found} session(s) SSH trouvée(s) dans {}\n\n• {added} importée(s)\n• {duplicates} déjà présente(s)",
-            path.display()
-        );
-        if !result.skipped.is_empty() {
-            body.push_str(&format!("\n• {} ignorée(s) :", result.skipped.len()));
-            for line in &result.skipped {
-                body.push_str(&format!("\n    – {line}"));
-            }
-        }
-        body.push_str("\n\nLes mots de passe ne sont pas importés : ils seront demandés à la connexion.");
-        self.notice = Some(("Import MobaXterm".into(), body));
     }
 
     // ------------------------------------------------------------------
@@ -1642,7 +1597,7 @@ impl FerroApp {
             ui.add_space(12.0);
             ui.label(RichText::new("Aucune session pour l'instant.").color(theme::p().text_dim));
             ui.label(
-                RichText::new("Créez-en une, ou importez celles de MobaXterm avec le bouton d'import ci-dessus.")
+                RichText::new("Créez-en une, ou importez un export Ferroterm (menu Session › Importer des sessions…).")
                     .small()
                     .color(theme::p().text_dim),
             );
@@ -2191,8 +2146,8 @@ impl FerroApp {
                     actions.push(Action::NewSession);
                 }
                 self.local_menu(ui, &theme::label(&theme::ICON_TERMINAL, "Terminal local"), actions);
-                if ui.button(theme::label(&theme::ICON_IMPORT, "Importer depuis MobaXterm")).clicked() {
-                    actions.push(Action::Import);
+                if ui.button(theme::label(&theme::ICON_UPLOAD, "Importer des sessions")).clicked() {
+                    actions.push(Action::ImportSessions);
                 }
             };
             let width_id = ui.scope_id().with("welcome_buttons_width");
@@ -4435,10 +4390,6 @@ impl FerroApp {
                     }
                     if ui.button(theme::label(&theme::ICON_UPLOAD, "Importer des sessions…")).clicked() {
                         actions.push(Action::ImportSessions);
-                        ui.close();
-                    }
-                    if ui.button(theme::label(&theme::ICON_IMPORT, "Importer depuis MobaXterm…")).clicked() {
-                        actions.push(Action::Import);
                         ui.close();
                     }
                     ui.separator();

@@ -62,7 +62,6 @@ Ferroterm aujourd'hui : clé privée OpenSSH ou mot de passe, enregistrables dan
 | [x] Mots de passe enregistrés (fait le 14/11/2026 : coffre Windows/DPAPI au lieu d'un mot de passe maître ; mots de passe SSH et phrases de passe des clés) | Identifiants mémorisés, protégés par un mot de passe maître | 1 |
 | [ ] Agent SSH | Pageant, agent OpenSSH, transfert d'agent (`ForwardAgent`) | 1 |
 | [ ] Hôte de rebond | « SSH jump host » : hôte, port et utilisateur de passerelle | 2 |
-| [ ] Import des mots de passe et passerelles depuis MobaXterm.ini | L'import actuel ne lit que hôte, port, utilisateur et clé | 2 |
 | [ ] Compression | Option par session | 3 |
 | [ ] Proxy HTTP | Connexion via `CONNECT` | 3 |
 

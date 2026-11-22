@@ -245,7 +245,6 @@ pub const ICON_DELETE: Icon = Icon("\u{e74d}", "\u{ea81}");
 pub const ICON_EDIT: Icon = Icon("\u{e70f}", "\u{ea73}");
 pub const ICON_COPY: Icon = Icon("\u{e8c8}", "\u{ebcc}");
 pub const ICON_PLAY: Icon = Icon("\u{e768}", "\u{eb2c}");
-pub const ICON_IMPORT: Icon = Icon("\u{e8b5}", "\u{ea6f}");
 pub const ICON_MACRO: Icon = Icon("\u{e945}", "\u{ea86}");
 
 /// Texte « icône + libellé ».

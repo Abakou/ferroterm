@@ -7,7 +7,6 @@ mod edit;
 mod ftp;
 mod highlight;
 mod local;
-mod mobaxterm;
 mod monitor;
 mod session;
 mod ssh;
